@@ -20,8 +20,8 @@ MAX_PAIR_IOU = 0.15
 MAX_INTERSECTION_OVER_MIN = 0.30
 MAX_MASK_SIZE = 6 * 1024 * 1024
 MIN_CENTER_DISTANCE_RATIO = 0.12
-# Prompt semantics changed; force existing selections to be regenerated once.
-SELECTION_MODE = "three-target-global-v2"
+# Independent target masks remove cumulative reasoning from the edit model.
+SELECTION_MODE = "three-target-global-v3-independent"
 
 PROMPT = """你会看到两张图：第一张是原始场景，第二张是自动分割候选物体的编号白底图。
 请选择恰好三个完整、独立、适合视觉编辑且空间距离较远的实体。
@@ -140,23 +140,17 @@ def make_outputs(
         image = source.convert("RGB")
     array = np.asarray(image)
     selected = [masks[candidate_id].astype(bool) for candidate_id in selected_ids]
-    cumulative: list[np.ndarray] = []
-    running = np.zeros(selected[0].shape, dtype=bool)
-    for mask in selected:
-        running = np.logical_or(running, mask)
-        cumulative.append(running.copy())
-    # The fourth quadrant is intentionally fully editable for global changes.
-    cumulative.append(np.ones_like(running, dtype=bool))
+    edit_regions = [*selected, np.ones_like(selected[0], dtype=bool)]
 
     mask_grid = Image.new("RGBA", (image.width * 2, image.height * 2), (0, 0, 0, 255))
     positions = ((0, 0), (image.width, 0), (0, image.height), (image.width, image.height))
-    for union, position in zip(cumulative, positions):
-        alpha = np.where(union, 0, 255).astype(np.uint8)
+    for region, position in zip(edit_regions, positions):
+        alpha = np.where(region, 0, 255).astype(np.uint8)
         mask_grid.paste(Image.fromarray(np.dstack((array, alpha)).astype(np.uint8), "RGBA"), position)
     buffer = io.BytesIO()
     mask_grid.save(buffer, "PNG", optimize=True)
     if buffer.tell() > MAX_MASK_SIZE:
-        raise ValueError(f"累计 Mask 为 {buffer.tell() / 1024 / 1024:.1f} MB，超过 6 MB")
+        raise ValueError(f"独立 Mask 为 {buffer.tell() / 1024 / 1024:.1f} MB，超过 6 MB")
 
     object_grid = Image.new("RGB", (image.width * 2, image.height * 2), "white")
     for index, (mask, position) in enumerate(zip(selected, positions), 1):
@@ -194,7 +188,7 @@ def make_outputs(
 
 
 def is_current_selection(path: Path) -> bool:
-    """Only v1 three-target selections are safe to reuse with the global Mask."""
+    """Only the current independent-mask selection is safe to reuse."""
     if not path.exists():
         return False
     try:

@@ -92,7 +92,7 @@ def test_validate_response_rejects_four_or_nearby_targets(tmp_path):
         validate_response({"selected_ids": [1, 2, 3], **rounds}, loaded, metadata)
 
 
-def test_make_outputs_uses_global_fourth_mask_and_version(tmp_path):
+def test_make_outputs_uses_independent_targets_and_global_fourth_mask(tmp_path):
     root = tmp_path / "IMAGE_MASK"
     (root / "IMAGE_2").mkdir(parents=True)
     Image.new("RGB", (8, 8), "gray").save(root / "IMAGE_2" / "sample.jpg")
@@ -115,7 +115,7 @@ def test_make_outputs_uses_global_fourth_mask_and_version(tmp_path):
 
     alpha = np.asarray(Image.open(root / "MASK" / "sample_MASK.png").getchannel("A")) < 128
     quadrants = [alpha[0:8, 0:8], alpha[0:8, 8:16], alpha[8:16, 0:8], alpha[8:16, 8:16]]
-    assert [int(mask.sum()) for mask in quadrants] == [1, 2, 3, 64]
+    assert [int(mask.sum()) for mask in quadrants] == [1, 1, 1, 64]
     selection_path = root / "SELECTION" / "sample_selection.json"
     assert is_current_selection(selection_path)
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
