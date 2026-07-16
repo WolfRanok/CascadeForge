@@ -4,6 +4,7 @@ API_KEY/
 .env.*
 !.env.example
 config.local.json
+.cascadeforge/
 *.key
 *.secret
 

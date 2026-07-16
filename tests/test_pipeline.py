@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from cascadeforge.config import load_config
@@ -56,6 +57,18 @@ def test_validate_response_orders_rounds_by_area(tmp_path):
     assert set(rounds) == {"ROUND_1", "ROUND_2", "ROUND_3", "ROUND_4"}
 
 
+def test_validate_response_rejects_candidate_id_in_instruction(tmp_path):
+    masks_path = tmp_path / "masks.npz"
+    masks = {str(index): np.pad(np.ones((2, 2), dtype=np.uint8), ((0 if index < 3 else 6, 6 if index < 3 else 0), (0 if index % 2 else 6, 6 if index % 2 else 0))) for index in range(1, 5)}
+    np.savez(masks_path, **masks)
+    response = {
+        "selected_ids": [1, 2, 3, 4],
+        **{f"ROUND_{i}": {"short": "修改", "long": f"将编号{i}目标改色"} for i in range(1, 5)},
+    }
+    with pytest.raises(ValueError, match="编号"):
+        validate_response(response, np.load(masks_path), [{"candidate_id": i, "area": 4} for i in range(1, 5)])
+
+
 def test_organize_splits_grid(tmp_path):
     edited = tmp_path / "abc_gpt_edited.jpg"
     source = tmp_path / "abc.jpg"
@@ -71,6 +84,7 @@ def test_config_environment_overrides_local(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"moliapi": {"api_key": "local", "model": "local-model"}}), encoding="utf-8")
     monkeypatch.setenv("GPT_API_KEY", "environment")
+    monkeypatch.setenv("GPT_MODEL", "environment-model")
     config = load_config(config_path)
     assert config.vision.api_key == "environment"
-    assert config.vision.model == "local-model"
+    assert config.vision.model == "environment-model"
