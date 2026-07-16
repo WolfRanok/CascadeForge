@@ -56,9 +56,14 @@ def test_build_prompt_contains_all_rounds():
     data = {f"ROUND_{index}": {"long": f"edit-{index}"} for index in range(1, 5)}
     prompt = editor.build_prompt_from_json(data)
     assert all(f"edit-{index}" in prompt for index in range(1, 5))
-    assert "整个右下象限" in prompt
-    assert "天气、昼夜、季节" in prompt
-    assert "禁止添加任何编号" in prompt
+    assert "复制左上结果，仅新增 edit-2" in prompt
+    assert "复制右上结果，仅新增 edit-3" in prompt
+    assert "变化必须明显可见" in prompt
+    assert "高对比颜色、明显材质或清晰图案" in prompt
+    assert "整图天气、昼夜、季节" in prompt
+    assert "禁止编号、文字" in prompt
+    assert "跨象限修改" in prompt
+    assert "硬性要求" not in prompt
 
 
 def test_sanitize_image_drops_exif(tmp_path):

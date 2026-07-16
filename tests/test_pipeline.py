@@ -27,6 +27,9 @@ def test_selection_prompt_preserves_short_and_long_length_rules():
     assert "ROUND_1 至 ROUND_4" in PROMPT
     assert "short 均不超过 10 个汉字" in PROMPT
     assert "long 均为 15–30 个汉字" in PROMPT
+    assert "明显、高对比、容易识别" in PROMPT
+    assert "目标 + 原状态 + 新状态" in PROMPT
+    assert "轻微改变" in PROMPT
 
 
 def test_iou_and_candidate_filter_remove_nested_masks():
