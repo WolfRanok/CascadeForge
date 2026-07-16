@@ -19,7 +19,8 @@ MAX_PAIR_IOU = 0.15
 MAX_INTERSECTION_OVER_MIN = 0.30
 MAX_MASK_SIZE = 6 * 1024 * 1024
 MIN_CENTER_DISTANCE_RATIO = 0.12
-SELECTION_MODE = "three-target-global-v1"
+# Prompt semantics changed; force existing selections to be regenerated once.
+SELECTION_MODE = "three-target-global-v2"
 
 PROMPT = """你会看到两张图：第一张是原始场景，第二张是自动分割候选物体的编号白底图。
 请选择恰好三个完整、独立、适合视觉编辑且空间距离较远的实体。
