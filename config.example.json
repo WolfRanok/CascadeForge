@@ -1,0 +1,24 @@
+{
+  "moliapi": {
+    "api_key": "",
+    "base_url": "https://api.example.com/v1",
+    "model": "replace-with-model-id"
+  },
+  "toapis": {
+    "api_key": "",
+    "base_url": "https://api.example.com",
+    "api_url": "https://api.example.com/v1/images/generations",
+    "upload_url": "https://api.example.com/v1/uploads/images",
+    "model": "gpt-image-2",
+    "resolution": "4k",
+    "response_format": "url"
+  },
+  "oss": {
+    "access_key_id": "",
+    "access_key_secret": "",
+    "bucket_name": "",
+    "endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
+    "path_prefix": "CASCADEFORGE_EDIT",
+    "sign_expires": 3600
+  }
+}

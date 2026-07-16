@@ -1,0 +1,36 @@
+# Local credentials and machine-specific configuration
+API_KEY/
+.env
+.env.*
+!.env.example
+config.local.json
+*.key
+*.secret
+
+# Private source data and generated artifacts
+100_CUT/
+IMAGE_MASK/
+OUTPUT/
+data/raw/
+data/private/
+tmp/
+
+# Python environments, caches, and build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

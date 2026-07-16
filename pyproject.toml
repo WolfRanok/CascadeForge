@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cascade-forge"
+version = "0.1.0"
+description = "A privacy-aware pipeline for cumulative multi-object image editing datasets."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "CascadeForge Contributors"}]
+keywords = ["computer-vision", "image-editing", "multimodal", "segmentation", "vlm"]
+dependencies = [
+  "numpy>=1.24",
+  "openai>=1.30",
+  "Pillow>=10.0",
+  "pycocotools>=2.0.7",
+  "python-dotenv>=1.0",
+  "requests>=2.31",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+cascadeforge = "cascadeforge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cascadeforge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

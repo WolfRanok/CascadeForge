@@ -1,0 +1,7 @@
+numpy>=1.24
+openai>=1.30
+Pillow>=10.0
+pycocotools>=2.0.7
+python-dotenv>=1.0
+requests>=2.31
+tqdm>=4.66
