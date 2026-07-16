@@ -34,6 +34,44 @@ def test_request_json_retries(monkeypatch):
     assert len(calls) == 2
 
 
+def test_extract_nested_url_before_top_level_task_id():
+    payload = {
+        "id": "task-1",
+        "status": "success",
+        "result": {"data": [{"url": "https://example.invalid/result.jpg"}]},
+    }
+    assert editor._extract_image_reference(payload) == (
+        "url",
+        "https://example.invalid/result.jpg",
+    )
+    assert editor._extract_task_id(payload) == "task-1"
+
+
+def test_extract_nested_base64_before_top_level_task_id():
+    payload = {
+        "id": "task-2",
+        "status": "success",
+        "result": {"data": [{"b64_json": "YWJj"}]},
+    }
+    assert editor._extract_image_reference(payload) == ("b64_json", "YWJj")
+    assert editor._extract_task_id(payload) == "task-2"
+
+
+def test_extract_task_only_and_legacy_shallow_url():
+    assert editor._extract_image_reference({"id": "task-3"}) is None
+    assert editor._extract_task_id({"id": "task-3"}) == "task-3"
+    assert editor._extract_image_reference({"data": [{"url": "https://example.invalid/a"}]}) == (
+        "url",
+        "https://example.invalid/a",
+    )
+
+
+def test_download_reference_decodes_base64(tmp_path):
+    output = tmp_path / "result.bin"
+    editor._download_reference(("b64_json", "YWJj"), output)
+    assert output.read_bytes() == b"abc"
+
+
 def test_build_prompt_contains_all_rounds():
     data = {f"ROUND_{index}": {"long": f"edit-{index}"} for index in range(1, 5)}
     prompt = editor.build_prompt_from_json(data)

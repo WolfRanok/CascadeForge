@@ -102,41 +102,69 @@ def _request_json(
     raise TransportError(f"请求失败：{last_error}") from last_error
 
 
+def _extract_image_reference(node: Any) -> tuple[str, str] | None:
+    """Find an image before considering any task ID in the same response."""
+    if isinstance(node, dict):
+        for key in ("url", "image_url"):
+            value = node.get(key)
+            if isinstance(value, str) and value:
+                return "url", value
+        encoded = node.get("b64_json")
+        if isinstance(encoded, str) and encoded:
+            return "b64_json", encoded
+        for value in node.values():
+            reference = _extract_image_reference(value)
+            if reference:
+                return reference
+    elif isinstance(node, list):
+        for value in node:
+            reference = _extract_image_reference(value)
+            if reference:
+                return reference
+    return None
+
+
+def _extract_task_id(payload: dict[str, Any]) -> str | None:
+    """Extract a task ID separately so it cannot hide a nested image result."""
+    for key in ("task_id", "taskId", "id"):
+        value = payload.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    for value in payload.values():
+        if isinstance(value, dict):
+            task_id = _extract_task_id(value)
+            if task_id:
+                return task_id
+    return None
+
+
 def _extract_reference(payload: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Extract an image reference from the several response shapes used by providers.
+    """Backward-compatible helper returning image value and task ID."""
+    reference = _extract_image_reference(payload)
+    if reference:
+        kind, value = reference
+        if kind == "b64_json":
+            value = f"data:image/png;base64,{value}"
+        return value, _extract_task_id(payload)
+    return None, _extract_task_id(payload)
 
-    Some deployments wrap results as ``result.data[0]`` and may return image
-    bytes as ``b64_json`` instead of a downloadable URL.  Normalising those
-    variants here keeps polling and upload handling consistent.
-    """
-    def walk(node: Any) -> tuple[str | None, str | None]:
-        if isinstance(node, dict):
-            for key in ("url", "image_url"):
-                value = node.get(key)
-                if isinstance(value, str) and value:
-                    return value, None
-            encoded = node.get("b64_json")
-            if isinstance(encoded, str) and encoded:
-                # Use a data URI so the downstream downloader can persist it.
-                return f"data:image/png;base64,{encoded}", None
-            for key in ("task_id", "taskId", "id"):
-                value = node.get(key)
-                if isinstance(value, (str, int)) and value:
-                    task = str(value)
-                    nested_url, _ = walk(node.get("data"))
-                    return nested_url, task
-            for value in node.values():
-                found_url, found_task = walk(value)
-                if found_url or found_task:
-                    return found_url, found_task
-        elif isinstance(node, list):
-            for value in node:
-                found_url, found_task = walk(value)
-                if found_url or found_task:
-                    return found_url, found_task
-        return None, None
 
-    return walk(payload)
+def _response_shape(node: Any, depth: int = 0) -> Any:
+    """Return field names and value types without logging URLs or image bytes."""
+    if depth >= 5:
+        return "<max-depth>"
+    if isinstance(node, dict):
+        result = {}
+        for key, value in node.items():
+            lowered = key.lower()
+            if lowered in {"url", "image_url", "b64_json", "token", "authorization"}:
+                result[key] = "<redacted>"
+            else:
+                result[key] = _response_shape(value, depth + 1)
+        return result
+    if isinstance(node, list):
+        return [_response_shape(node[0], depth + 1)] if node else []
+    return f"<{type(node).__name__}>"
 
 
 def _quadrant_boxes(width: int, height: int) -> tuple[tuple[int, int, int, int], ...]:
@@ -337,24 +365,56 @@ def _download(url: str, output: Path) -> None:
     output.write_bytes(response.content)
 
 
-def _poll(task_id: str, config: AppConfig) -> str:
+def _download_reference(reference: tuple[str, str], output: Path) -> None:
+    """Persist either a remote URL or an inline Base64 image."""
+    kind, value = reference
+    if kind == "url":
+        _download(value, output)
+        return
+    if kind == "b64_json":
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(base64.b64decode(value, validate=True))
+        return
+    raise TransportError(f"不支持的图片返回类型：{kind}")
+
+
+def _poll(task_id: str, config: AppConfig) -> tuple[str, str]:
     if not config.edit.api_key:
         raise TransportError("未配置 TOAPIS_API_KEY")
     status_url = f"{config.edit.base_url.rstrip('/')}/v1/images/generations/{task_id}"
     headers = {"Authorization": f"Bearer {config.edit.api_key}"}
     started = time.monotonic()
+    success_without_image = 0
     while time.monotonic() - started < 600:
         payload = _request_json("GET", status_url, headers=headers, timeout=120)
         status = str(payload.get("status", "")).lower()
         if status in SUCCESS_STATUSES:
-            url, _ = _extract_reference(payload)
-            if url:
-                return url
-            raise TransportError("任务成功但没有返回图片 URL")
+            reference = _extract_image_reference(payload)
+            if reference:
+                return reference
+            # Some providers expose success briefly before attaching result data.
+            success_without_image += 1
+            if success_without_image >= 3:
+                shape = json.dumps(_response_shape(payload), ensure_ascii=False)
+                raise TransportError(f"任务成功但没有返回图片；响应结构：{shape[:1000]}")
         if status in FAILED_STATUSES:
-            raise TransportError(f"编辑任务失败：{payload}")
+            shape = json.dumps(_response_shape(payload), ensure_ascii=False)
+            raise TransportError(f"编辑任务失败；响应结构：{shape[:1000]}")
         time.sleep(5)
     raise TransportError("编辑任务轮询超时")
+
+
+def _write_task_cache(
+    path: Path, digest: str, model: str, *, task_id: str | None = None, url: str | None = None
+) -> None:
+    """Save resumable state without persisting inline image data."""
+    payload: dict[str, str] = {"md5": digest, "model": model}
+    if task_id:
+        payload["task_id"] = task_id
+    if url:
+        payload["url"] = url
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "gpt") -> dict[str, Any]:
@@ -390,13 +450,20 @@ def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "
             result["status"] = "success"
             result["output"] = str(output_path)
             return result
-        # Reuse a saved URL when a previous run completed the remote task.
+        # Resume a saved task before creating another paid request.
+        reference: tuple[str, str] | None = None
+        task_id: str | None = None
         if download_json.exists():
             cached = json.loads(download_json.read_text(encoding="utf-8"))
-            url = cached.get("url")
-        else:
-            url = None
-        if not url:
+            cached_url = cached.get("url")
+            if isinstance(cached_url, str) and cached_url:
+                reference = ("url", cached_url)
+            cached_task_id = cached.get("task_id")
+            if isinstance(cached_task_id, (str, int)) and str(cached_task_id).strip():
+                task_id = str(cached_task_id).strip()
+        if reference is None and task_id:
+            reference = _poll(task_id, config)
+        if reference is None:
             image_url = _upload(image_path, config)
             mask_url = _upload(independent_upload_mask(input_root, digest), config)
             prompt = build_prompt_from_json(json.loads(json_path.read_text(encoding="utf-8")))
@@ -418,17 +485,19 @@ def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "
                 "mask_url": mask_url,
             }
             response = _request_json("POST", config.edit.api_url, headers=headers, json=payload)
-            url, task_id = _extract_reference(response)
-            if not url and task_id:
-                url = _poll(str(task_id), config)
-            if not url:
+            reference = _extract_image_reference(response)
+            task_id = _extract_task_id(response)
+            if task_id:
+                # Persist immediately so an interrupted poll can resume safely.
+                _write_task_cache(download_json, digest, model, task_id=task_id)
+            if reference is None and task_id:
+                reference = _poll(task_id, config)
+            if reference is None:
                 raise TransportError("编辑 API 未返回 URL 或任务 ID")
-            download_json.parent.mkdir(parents=True, exist_ok=True)
-            download_json.write_text(
-                json.dumps({"url": url, "md5": digest, "model": model}, indent=2), encoding="utf-8"
-            )
+        if reference[0] == "url":
+            _write_task_cache(download_json, digest, model, task_id=task_id, url=reference[1])
         if not raw_path.exists():
-            _download(url, raw_path)
+            _download_reference(reference, raw_path)
         # Keep the raw provider response locally, but expose only the
         # deterministic, Mask-constrained result under the old output name.
         normalize_grid(input_root, digest, raw_path, output_path)
