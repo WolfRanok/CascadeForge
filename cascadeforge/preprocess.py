@@ -217,7 +217,7 @@ def process_image(path: Path, output_dir: Path) -> tuple[str, str, str]:
             masks.append(mask[top : top + new_height, left : left + new_width])
 
         candidates = select_candidates(annotations, masks, new_width, new_height)
-        if len(candidates) < 4:
+        if len(candidates) < 3:
             return path.stem, "skip", f"只有 {len(candidates)} 个有效候选"
 
         # Estimate the cumulative mask payload before creating all output files.

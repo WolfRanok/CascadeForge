@@ -11,8 +11,8 @@ CascadeForge 将“候选目标筛选 → 视觉语言模型选择 → 四轮累
 ## 核心能力
 
 - 从 SA-1B 风格 JSON 中解码 COCO RLE，并按面积、质量、边界和重叠度筛选候选目标。
-- 使用视觉语言模型从候选图中选择四个彼此独立的实体，并生成四轮编辑提示词。
-- 以累计 Mask 构造四宫格：左上执行第一轮，右上累计前两轮，左下累计前三轮，右下累计四轮。
+- 使用视觉语言模型选择三个彼此分离的实体，并生成三轮目标编辑与一轮全局变换提示词。
+- 以累计 Mask 构造四宫格：前三格依次累计三个目标，第四格开放整图以改变天气、昼夜或整体氛围。
 - 支持 OpenAI-compatible 视觉模型、图像编辑 API 和可选 OSS 图片暂存；凭据只从环境变量或本地配置读取。
 - 对元数据、路径、下载 URL 和发布样例提供显式脱敏边界，避免将本地数据或密钥带入 Git。
 
@@ -22,15 +22,15 @@ CascadeForge 将“候选目标筛选 → 视觉语言模型选择 → 四轮累
 flowchart LR
     A[原图 + 分割 JSON] --> B[候选筛选]
     B --> C[候选编号图 + Mask]
-    C --> D[VLM 选择四个目标]
-    D --> E[累计 Mask + 四轮提示词]
+    C --> D[VLM 选择三个分离目标]
+    D --> E[三轮累计 Mask + 第四轮全图 Mask]
     E --> F[一次四宫格编辑请求]
     F --> G[ROUND_1~4 + original]
 ```
 
 ![Cumulative mask progression](docs/assets/cascadeforge-masks.png)
 
-上图为原创示意图：四个面板对应从单层到四层的累计 Mask，不代表仓库内的真实数据样例。
+上图为原创 Mask 示意图，不代表仓库内的真实数据样例；当前第四面板实际使用全图可编辑 Mask。
 
 ## 快速开始
 
@@ -65,7 +65,7 @@ python organize_results_ac.py
 
 | 能力 | 关键变量 | 用途 |
 | --- | --- | --- |
-| 视觉选择 | `GPT_API_KEY`、`GPT_BASE_URL`、`GPT_MODEL` | 选择四个独立目标并生成提示词 |
+| 视觉选择 | `GPT_API_KEY`、`GPT_BASE_URL`、`GPT_MODEL` | 选择三个分离目标并生成三轮目标提示词与一轮全局提示词 |
 | 图像编辑 | `TOAPIS_API_KEY`、`TOAPIS_API_URL` | 提交四宫格累计编辑任务 |
 | 图片暂存 | `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET` | 编辑 API 无法直接读取本地文件时上传图片 |
 
@@ -78,7 +78,7 @@ IMAGE_MASK/
 ├── CANDIDATES/       候选编号图、候选 Mask 和元数据
 ├── JSON/             四轮编辑提示词
 ├── MASK/             累计四宫格透明 Mask
-├── OBJECT/           四个选中目标的白底预览
+├── OBJECT/           三个选中目标与全局编辑区域预览
 ├── SELECTION/        目标选择记录
 └── EDITED_4K/        编辑 API 返回的四宫格图
 
