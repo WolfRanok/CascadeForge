@@ -103,12 +103,40 @@ def _request_json(
 
 
 def _extract_reference(payload: dict[str, Any]) -> tuple[str | None, str | None]:
-    data = payload.get("data") or payload.get("result") or payload
-    if isinstance(data, list):
-        data = data[0] if data else {}
-    if isinstance(data, dict):
-        return data.get("url") or data.get("image_url"), data.get("task_id") or data.get("id")
-    return None, None
+    """Extract an image reference from the several response shapes used by providers.
+
+    Some deployments wrap results as ``result.data[0]`` and may return image
+    bytes as ``b64_json`` instead of a downloadable URL.  Normalising those
+    variants here keeps polling and upload handling consistent.
+    """
+    def walk(node: Any) -> tuple[str | None, str | None]:
+        if isinstance(node, dict):
+            for key in ("url", "image_url"):
+                value = node.get(key)
+                if isinstance(value, str) and value:
+                    return value, None
+            encoded = node.get("b64_json")
+            if isinstance(encoded, str) and encoded:
+                # Use a data URI so the downstream downloader can persist it.
+                return f"data:image/png;base64,{encoded}", None
+            for key in ("task_id", "taskId", "id"):
+                value = node.get(key)
+                if isinstance(value, (str, int)) and value:
+                    task = str(value)
+                    nested_url, _ = walk(node.get("data"))
+                    return nested_url, task
+            for value in node.values():
+                found_url, found_task = walk(value)
+                if found_url or found_task:
+                    return found_url, found_task
+        elif isinstance(node, list):
+            for value in node:
+                found_url, found_task = walk(value)
+                if found_url or found_task:
+                    return found_url, found_task
+        return None, None
+
+    return walk(payload)
 
 
 def _quadrant_boxes(width: int, height: int) -> tuple[tuple[int, int, int, int], ...]:
@@ -297,6 +325,12 @@ def _upload(path: Path, config: AppConfig) -> str:
 
 
 def _download(url: str, output: Path) -> None:
+    if url.startswith("data:") and ";base64," in url:
+        # Providers can return b64_json for completed tasks; decode locally.
+        encoded = url.split(";base64,", 1)[1]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(base64.b64decode(encoded))
+        return
     response = requests.get(url, timeout=300)
     response.raise_for_status()
     output.parent.mkdir(parents=True, exist_ok=True)
