@@ -78,13 +78,42 @@ def _request_json(
     raise TransportError(f"请求失败：{last_error}") from last_error
 
 
+def _extract_image_url(node: Any) -> str | None:
+    """Search the complete response for an image URL before reading task IDs."""
+    if isinstance(node, dict):
+        for key in ("url", "image_url"):
+            value = node.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for value in node.values():
+            url = _extract_image_url(value)
+            if url:
+                return url
+    elif isinstance(node, list):
+        for value in node:
+            url = _extract_image_url(value)
+            if url:
+                return url
+    return None
+
+
+def _extract_task_id(payload: dict[str, Any]) -> str | None:
+    """Read the task ID independently so it cannot hide a nested result URL."""
+    for key in ("task_id", "taskId", "id"):
+        value = payload.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    for value in payload.values():
+        if isinstance(value, dict):
+            task_id = _extract_task_id(value)
+            if task_id:
+                return task_id
+    return None
+
+
 def _extract_reference(payload: dict[str, Any]) -> tuple[str | None, str | None]:
-    data = payload.get("data") or payload.get("result") or payload
-    if isinstance(data, list):
-        data = data[0] if data else {}
-    if isinstance(data, dict):
-        return data.get("url") or data.get("image_url"), data.get("task_id") or data.get("id")
-    return None, None
+    """Return both fields after independently inspecting the whole response."""
+    return _extract_image_url(payload), _extract_task_id(payload)
 
 
 def _oss_url(path: Path, config: AppConfig, method: str) -> str:

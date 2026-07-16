@@ -32,6 +32,26 @@ def test_request_json_retries(monkeypatch):
     assert len(calls) == 2
 
 
+def test_extract_nested_result_url_with_top_level_task_id():
+    payload = {
+        "id": "task-1",
+        "status": "success",
+        "result": {"data": [{"url": "https://example.invalid/result.jpg"}]},
+    }
+    assert editor._extract_reference(payload) == (
+        "https://example.invalid/result.jpg",
+        "task-1",
+    )
+
+
+def test_extract_legacy_shallow_url_and_task_only_response():
+    assert editor._extract_reference({"data": [{"url": "https://example.invalid/a.jpg"}]}) == (
+        "https://example.invalid/a.jpg",
+        None,
+    )
+    assert editor._extract_reference({"id": "task-2"}) == (None, "task-2")
+
+
 def test_build_prompt_contains_all_rounds():
     data = {f"ROUND_{index}": {"long": f"edit-{index}"} for index in range(1, 5)}
     prompt = editor.build_prompt_from_json(data)
