@@ -20,34 +20,33 @@ MAX_PAIR_IOU = 0.15
 MAX_INTERSECTION_OVER_MIN = 0.30
 MAX_MASK_SIZE = 6 * 1024 * 1024
 MIN_CENTER_DISTANCE_RATIO = 0.12
-# Independent target masks remove cumulative reasoning from the edit model.
-SELECTION_MODE = "three-target-global-v3-independent"
+# Four independent target masks remove cumulative reasoning from the edit model.
+SELECTION_MODE = "four-target-independent-v1"
 
 PROMPT = """你会看到两张图：第一张是原始场景，第二张是自动分割候选物体的编号白底图。
-请选择恰好三个完整、独立、适合视觉编辑且空间距离较远的实体。
+请选择恰好四个完整、独立、适合视觉编辑且空间距离较远的实体。
 
 要求：
-1. 只能返回候选图中实际存在的三个不同 ID。
+1. 只能返回候选图中实际存在的四个不同 ID。
 2. 不选择天空、地面、水面、墙体、整片人群等背景或群组。
-3. 三个目标不得重叠或相邻，应尽量分布在画面的不同位置，便于准确定位。
-4. ROUND_1 至 ROUND_3 各编辑一个新目标。修改必须明显、高对比、容易识别。
-5. ROUND_4 不绑定候选 ID，描述基于第三轮结果的整图天气、昼夜、季节、光照、
-   氛围或整体色调变换。
+3. 四个目标不得重叠或相邻，应尽量分布在画面的不同位置，便于准确定位。
+4. ROUND_1 至 ROUND_4 各编辑一个新目标。修改必须明显、高对比、容易识别。
+5. 四轮都只描述对应目标的局部变化，不描述整图天气、昼夜、季节或整体色调变换。
 6. ROUND_1 至 ROUND_4 的 short 均不超过 10 个汉字，long 均为 15–30 个汉字。
 7. long 必须使用“位置和外观明确的目标，清晰变化”的单句格式，不写候选编号，
    禁止“稍微改变、略微调整、适当装饰、变得特别”等模糊表达。
-8. 前三轮优先从颜色、材质、尺寸、纹理和物体类别中选择变化，三轮尽量使用不同类型，
+8. 四轮优先从颜色、材质、尺寸、纹理和物体类别中选择变化，尽量使用不同类型，
    不添加额外环境特效，避免重复生成同一种修改。
 
 合格示例：
 - 左上部的白色蘑菇，尺寸明显变大一倍
 - 画面中间的鲜绿色叶片，变成红色枫叶
 - 右下角的棕色枯叶，变成半透明蓝色玻璃叶片
-- 整张图的整体色调调暖，呈现温暖金色氛围
+- 右上部的灰色石块，变成明亮黄色陶瓷石块
 
 严格输出 JSON，不要输出解释或 Markdown：
 {
-  "selected_ids": [1, 2, 3],
+  "selected_ids": [1, 2, 3, 4],
   "ROUND_1": {"short": "...", "long": "..."},
   "ROUND_2": {"short": "...", "long": "..."},
   "ROUND_3": {"short": "...", "long": "..."},
@@ -92,14 +91,14 @@ def center_distance_ratio(left: np.ndarray, right: np.ndarray) -> float:
 
 def validate_response(data: dict, masks: np.lib.npyio.NpzFile, candidate_meta: list[dict]):
     ids = data.get("selected_ids")
-    if not isinstance(ids, list) or len(ids) != 3 or len(set(ids)) != 3:
-        raise ValueError("selected_ids 必须包含三个不同 ID")
+    if not isinstance(ids, list) or len(ids) != 4 or len(set(ids)) != 4:
+        raise ValueError("selected_ids 必须包含四个不同 ID")
     ids = [str(int(value)) for value in ids]
     if any(candidate_id not in masks.files for candidate_id in ids):
         raise ValueError("模型选择了不存在的候选 ID")
     selected_masks = [masks[candidate_id].astype(bool) for candidate_id in ids]
-    for left_index in range(3):
-        for right_index in range(left_index + 1, 3):
+    for left_index in range(4):
+        for right_index in range(left_index + 1, 4):
             pair_iou, iom = overlap(selected_masks[left_index], selected_masks[right_index])
             if pair_iou > MAX_PAIR_IOU or iom > MAX_INTERSECTION_OVER_MIN:
                 raise ValueError(f"候选 {ids[left_index]} 与 {ids[right_index]} 重叠过多")
@@ -120,12 +119,11 @@ def validate_response(data: dict, masks: np.lib.npyio.NpzFile, candidate_meta: l
     # Larger targets are edited first to make cumulative changes easier to preserve.
     area_by_id = {str(item["candidate_id"]): int(item["area"]) for item in candidate_meta}
     ordered = sorted(ids, key=lambda candidate_id: area_by_id[candidate_id], reverse=True)
-    original_rounds = {ids[index]: data[f"ROUND_{index + 1}"] for index in range(3)}
+    original_rounds = {ids[index]: data[f"ROUND_{index + 1}"] for index in range(4)}
     rounds = {
         f"ROUND_{index + 1}": original_rounds[candidate_id]
         for index, candidate_id in enumerate(ordered)
     }
-    rounds["ROUND_4"] = data["ROUND_4"]
     return ordered, rounds
 
 
@@ -142,7 +140,7 @@ def make_outputs(
         image = source.convert("RGB")
     array = np.asarray(image)
     selected = [masks[candidate_id].astype(bool) for candidate_id in selected_ids]
-    edit_regions = [*selected, np.ones_like(selected[0], dtype=bool)]
+    edit_regions = selected
 
     mask_grid = Image.new("RGBA", (image.width * 2, image.height * 2), (0, 0, 0, 255))
     positions = ((0, 0), (image.width, 0), (0, image.height), (image.width, image.height))
@@ -161,11 +159,6 @@ def make_outputs(
         draw.rectangle((8, 8, 82, 48), fill="black")
         draw.text((18, 15), f"#{index}", fill="white")
         object_grid.paste(tile, position)
-    global_tile = image.copy()
-    global_draw = ImageDraw.Draw(global_tile)
-    global_draw.rectangle((8, 8, 150, 48), fill="black")
-    global_draw.text((18, 15), "GLOBAL", fill="white")
-    object_grid.paste(global_tile, positions[3])
 
     json_dir, mask_dir = output_root / "JSON", output_root / "MASK"
     object_dir, selection_dir = output_root / "OBJECT", output_root / "SELECTION"
@@ -205,6 +198,9 @@ def process_one(meta_path: Path, output_root: Path, client: OpenAI, model: str):
     json_path = output_root / "JSON" / f"{digest}_JSON_gpt.json"
     mask_path = output_root / "MASK" / f"{digest}_MASK.png"
     selection_path = output_root / "SELECTION" / f"{digest}_selection.json"
+    # Do not detach an existing final image from the metadata that produced it.
+    if (output_root / "EDITED_4K" / f"{digest}_gpt_edited.jpg").exists():
+        return True, digest, "跳过已有正式结果"
     if json_path.exists() and mask_path.exists() and is_current_selection(selection_path):
         return True, digest, "跳过已有结果"
     try:
@@ -262,6 +258,9 @@ def pending_metadata(output_root: Path, attempted: set[str]) -> list[Path]:
         mask_path = output_root / "MASK" / f"{digest}_MASK.png"
         selection_path = output_root / "SELECTION" / f"{digest}_selection.json"
         if json_path.exists() and mask_path.exists() and is_current_selection(selection_path):
+            continue
+        # Completed legacy outputs remain paired with their original metadata.
+        if (output_root / "EDITED_4K" / f"{digest}_gpt_edited.jpg").exists():
             continue
         pending.append(meta_path)
     return pending

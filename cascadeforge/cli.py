@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     preprocess.add_argument("--output", type=Path, required=True, help="中间产物目录")
     preprocess.add_argument("--workers", type=int, default=4)
 
-    select = sub.add_parser("select", help="选择三个分离目标并生成第四轮全局变换")
+    select = sub.add_parser("select", help="选择四个分离目标并生成四轮局部编辑")
     select.add_argument("--input", type=Path, default=Path("IMAGE_MASK"))
     select.add_argument("--config", type=Path)
     select.add_argument("--concurrency", type=int, default=8)

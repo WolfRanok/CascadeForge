@@ -15,6 +15,7 @@ from cascadeforge.select import (
     SELECTION_MODE,
     is_current_selection,
     make_outputs,
+    pending_metadata,
     process_one as select_one,
     validate_response,
 )
@@ -58,24 +59,30 @@ def test_validate_response_orders_rounds_by_area(tmp_path):
             "1": np.pad(np.ones((2, 2), dtype=np.uint8), ((0, 6), (0, 6))),
             "2": np.pad(np.ones((2, 2), dtype=np.uint8), ((0, 6), (6, 0))),
             "3": np.pad(np.ones((2, 2), dtype=np.uint8), ((6, 0), (0, 6))),
+            "4": np.pad(np.ones((2, 2), dtype=np.uint8), ((6, 0), (6, 0))),
         },
     )
     masks = np.load(masks_path)
     data = {
-        "selected_ids": [1, 2, 3],
+        "selected_ids": [1, 2, 3, 4],
         **{f"ROUND_{i}": {"short": str(i), "long": f"修改目标 {i} 的颜色"} for i in range(1, 5)},
     }
     selected, rounds = validate_response(
         data,
         masks,
-        [{"candidate_id": 1, "area": 1}, {"candidate_id": 2, "area": 40}, {"candidate_id": 3, "area": 20}],
+        [
+            {"candidate_id": 1, "area": 1},
+            {"candidate_id": 2, "area": 40},
+            {"candidate_id": 3, "area": 20},
+            {"candidate_id": 4, "area": 10},
+        ],
     )
-    assert selected == ["2", "3", "1"]
+    assert selected == ["2", "3", "4", "1"]
     assert set(rounds) == {"ROUND_1", "ROUND_2", "ROUND_3", "ROUND_4"}
-    assert rounds["ROUND_4"] == data["ROUND_4"]
+    assert rounds["ROUND_4"] == data["ROUND_1"]
 
 
-def test_validate_response_rejects_four_or_nearby_targets(tmp_path):
+def test_validate_response_rejects_three_or_nearby_targets(tmp_path):
     masks_path = tmp_path / "masks.npz"
     masks = {}
     for key, position in {"1": (1, 1), "2": (3, 1), "3": (18, 18), "4": (1, 18)}.items():
@@ -86,18 +93,18 @@ def test_validate_response_rejects_four_or_nearby_targets(tmp_path):
     loaded = np.load(masks_path)
     metadata = [{"candidate_id": int(key), "area": 1} for key in masks]
     rounds = {f"ROUND_{i}": {"short": str(i), "long": f"instruction {i}"} for i in range(1, 5)}
-    with pytest.raises(ValueError, match="三个不同"):
-        validate_response({"selected_ids": [1, 2, 3, 4], **rounds}, loaded, metadata)
-    with pytest.raises(ValueError, match="距离过近"):
+    with pytest.raises(ValueError, match="四个不同"):
         validate_response({"selected_ids": [1, 2, 3], **rounds}, loaded, metadata)
+    with pytest.raises(ValueError, match="距离过近"):
+        validate_response({"selected_ids": [1, 2, 3, 4], **rounds}, loaded, metadata)
 
 
-def test_make_outputs_uses_independent_targets_and_global_fourth_mask(tmp_path):
+def test_make_outputs_uses_four_independent_target_masks(tmp_path):
     root = tmp_path / "IMAGE_MASK"
     (root / "IMAGE_2").mkdir(parents=True)
     Image.new("RGB", (8, 8), "gray").save(root / "IMAGE_2" / "sample.jpg")
     mask_arrays = {}
-    for key, position in {"1": (0, 0), "2": (7, 0), "3": (0, 7)}.items():
+    for key, position in {"1": (0, 0), "2": (7, 0), "3": (0, 7), "4": (7, 7)}.items():
         mask = np.zeros((8, 8), dtype=np.uint8)
         mask[position[1], position[0]] = 1
         mask_arrays[key] = mask
@@ -111,11 +118,11 @@ def test_make_outputs_uses_independent_targets_and_global_fourth_mask(tmp_path):
         ]
     }
 
-    make_outputs(root, "sample", ["1", "2", "3"], rounds, metadata, masks)
+    make_outputs(root, "sample", ["1", "2", "3", "4"], rounds, metadata, masks)
 
     alpha = np.asarray(Image.open(root / "MASK" / "sample_MASK.png").getchannel("A")) < 128
     quadrants = [alpha[0:8, 0:8], alpha[0:8, 8:16], alpha[8:16, 0:8], alpha[8:16, 8:16]]
-    assert [int(mask.sum()) for mask in quadrants] == [1, 1, 1, 64]
+    assert [int(mask.sum()) for mask in quadrants] == [1, 1, 1, 1]
     selection_path = root / "SELECTION" / "sample_selection.json"
     assert is_current_selection(selection_path)
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
@@ -126,6 +133,18 @@ def test_old_selection_is_not_reused(tmp_path):
     path = tmp_path / "selection.json"
     path.write_text(json.dumps({"selected_ids": [1, 2, 3, 4]}), encoding="utf-8")
     assert not is_current_selection(path)
+
+
+def test_completed_legacy_selection_is_not_regenerated(tmp_path):
+    root = tmp_path / "IMAGE_MASK"
+    (root / "CANDIDATES").mkdir(parents=True)
+    (root / "EDITED_4K").mkdir()
+    (root / "CANDIDATES" / "sample_meta.json").write_text("{}", encoding="utf-8")
+    Image.new("RGB", (8, 8), "gray").save(
+        root / "EDITED_4K" / "sample_gpt_edited.jpg"
+    )
+
+    assert pending_metadata(root, set()) == []
 
 
 def test_old_selection_is_regenerated_and_invalid_choice_retried(tmp_path):
@@ -157,8 +176,8 @@ def test_old_selection_is_regenerated_and_invalid_choice_retried(tmp_path):
     )
     rounds = {f"ROUND_{index}": {"short": str(index), "long": f"instruction {index}"} for index in range(1, 5)}
     replies = [
-        {"selected_ids": [1, 2, 3, 4], **rounds},
         {"selected_ids": [1, 2, 3], **rounds},
+        {"selected_ids": [1, 2, 3, 4], **rounds},
     ]
 
     class FakeCompletions:
@@ -240,6 +259,7 @@ def test_config_environment_overrides_local(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"moliapi": {"api_key": "local", "model": "local-model"}}), encoding="utf-8")
     monkeypatch.setenv("GPT_API_KEY", "environment")
+    monkeypatch.setenv("GPT_MODEL", "local-model")
     config = load_config(config_path)
     assert config.vision.api_key == "environment"
     assert config.vision.model == "local-model"

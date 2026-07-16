@@ -22,7 +22,9 @@ from .config import AppConfig, load_config
 
 SUCCESS_STATUSES = {"completed", "succeeded", "success"}
 FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
-PIPELINE_VERSION = "independent-global-v1"
+PIPELINE_VERSION = "four-target-independent-v1"
+SELECTION_MODE = "four-target-independent-v1"
+LEGACY_GLOBAL_MODE = "three-target-global-v3-independent"
 MIN_MEAN_DIFFERENCE = 18.0
 MIN_CHANGED_RATIO = 0.25
 SUPPORTED_RATIOS = {
@@ -49,15 +51,15 @@ def build_prompt_from_json(data: dict[str, Any]) -> str:
 左上：只编辑透明 Mask 内的物体：{rounds[0]}
 右上：只编辑透明 Mask 内的物体：{rounds[1]}
 左下：只编辑透明 Mask 内的物体：{rounds[2]}
-右下：执行整图变换：{rounds[3]}
+右下：只编辑透明 Mask 内的物体：{rounds[3]}
 
 规则：
-1. 前三格互不依赖，每格只完成自己的一项编辑。
+1. 四格互不依赖，每格只完成自己的一项编辑。
 2. 透明 Mask 是唯一目标位置；忽略指令中可能不准确的位置词。
 3. Mask 内变化必须明显，Mask 外保持原图。
 4. 保持物体轮廓、姿态、位置和数量不变。
-5. 右下可改变整图天气、昼夜、季节、光照、氛围和色调。
-6. 禁止编号、文字、标签、边框、水印、UI 和跨象限修改。"""
+5. 四格都禁止改变整图天气、昼夜、季节、光照、氛围和整体色调。
+6. 禁止编号、文字、标签、边框、水印、UI、额外物体和跨象限修改。"""
 
 
 class TransportError(RuntimeError):
@@ -169,7 +171,7 @@ def _quadrant_boxes(width: int, height: int) -> tuple[tuple[int, int, int, int],
 
 
 def _target_masks(input_root: Path, digest: str) -> list[np.ndarray]:
-    """Load v3 independent masks or derive them from a legacy cumulative grid."""
+    """Load four independent masks or derive them from a legacy cumulative grid."""
     mask_path = input_root / "MASK" / f"{digest}_MASK.png"
     with Image.open(mask_path) as source:
         alpha = np.asarray(source.convert("RGBA").getchannel("A")) < 128
@@ -186,14 +188,18 @@ def _target_masks(input_root: Path, digest: str) -> list[np.ndarray]:
             )
         except (OSError, json.JSONDecodeError):
             pass
-    if mode == "three-target-global-v3-independent":
-        return [mask.astype(bool) for mask in quadrants[:3]]
+    if mode == SELECTION_MODE:
+        return [mask.astype(bool) for mask in quadrants]
+    if mode == LEGACY_GLOBAL_MODE or quadrants[3].all():
+        raise TransportError(
+            "检测到旧三目标全局 Mask，请先运行 python process_vl_ac.py 重新选择四个目标"
+        )
 
-    # Legacy grids accumulated prior targets; adjacent differences recover
-    # the three single-target regions without another segmentation call.
+    # Older four-target grids accumulated prior targets. Adjacent differences
+    # recover four independent regions without another segmentation call.
     targets: list[np.ndarray] = []
     used = np.zeros_like(quadrants[0], dtype=bool)
-    for mask in quadrants[:3]:
+    for mask in quadrants:
         target = np.logical_and(mask, np.logical_not(used))
         targets.append(target)
         used = np.logical_or(used, mask)
@@ -213,13 +219,13 @@ def materialize_upload_mask(input_root: Path, digest: str) -> Path:
                 f"Mask 尺寸 {mask_source.size} 与四宫格原图尺寸 {image.size} 不一致"
             )
     targets = _target_masks(input_root, digest)
-    if len(targets) != 3 or any(not target.any() for target in targets):
-        raise TransportError("前三个象限必须各自包含一个非空目标 Mask")
+    if len(targets) != 4 or any(not target.any() for target in targets):
+        raise TransportError("四个象限必须各自包含一个非空目标 Mask")
     height, width = targets[0].shape
     if image.size != (width * 2, height * 2):
         raise TransportError("目标 Mask 象限尺寸与四宫格原图不一致")
 
-    regions = [*targets, np.ones_like(targets[0], dtype=bool)]
+    regions = targets
     image_array = np.asarray(image)
     output = Image.new("RGBA", image.size, (0, 0, 0, 255))
     counts: list[int] = []
@@ -229,9 +235,6 @@ def materialize_upload_mask(input_root: Path, digest: str) -> Path:
         tile = np.dstack((image_array[y0:y1, x0:x1], alpha)).astype(np.uint8)
         output.paste(Image.fromarray(tile, "RGBA"), (x0, y0))
         counts.append(int(region.sum()))
-    if counts[3] != width * height:
-        raise TransportError("第四象限必须为全图可编辑 Mask")
-
     destination = input_root / ".cascadeforge" / "upload_masks" / f"{digest}_MASK.png"
     destination.parent.mkdir(parents=True, exist_ok=True)
     output.save(destination, "PNG", optimize=True)
@@ -283,7 +286,7 @@ def _is_rejected(input_root: Path, digest: str) -> bool:
 def compose_and_measure(
     input_root: Path, digest: str, raw_path: Path, destination: Path
 ) -> tuple[bool, list[dict[str, Any]]]:
-    """Accumulate three independent edits and enforce every protected pixel locally."""
+    """Accumulate four independent edits and enforce every protected pixel locally."""
     original_path = input_root / "IMAGE_2" / f"{digest}.jpg"
     with Image.open(raw_path) as raw_source, Image.open(original_path) as original_source:
         generated = raw_source.convert("RGB")
@@ -336,14 +339,6 @@ def compose_and_measure(
             current[mask] = model_frame[mask]
             frames.append(current)
             previous = current
-
-        # Use the model's global fourth result, then restore all three edited
-        # targets so the global pass cannot erase prior object changes.
-        x0, y0, x1, y1 = _quadrant_boxes(width, height)[3]
-        global_frame = generated_array[y0:y1, x0:x1].copy()
-        target_union = np.logical_or.reduce(masks)
-        global_frame[target_union] = frames[2][target_union]
-        frames.append(global_frame)
 
         composed = Image.new("RGB", generated.size)
         for frame, box in zip(frames, _quadrant_boxes(width, height)):
