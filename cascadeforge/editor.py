@@ -59,6 +59,29 @@ class TransportError(RuntimeError):
     """Raised when an upload, submit, poll, or download operation fails."""
 
 
+def _http_error(response: requests.Response) -> TransportError:
+    """Convert provider errors into actionable messages without exposing secrets."""
+    code = ""
+    message = ""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            code = str(payload.get("code", ""))
+            message = str(payload.get("message", ""))
+            error = payload.get("error")
+            if isinstance(error, dict):
+                code = code or str(error.get("code", ""))
+                message = message or str(error.get("message", ""))
+            elif isinstance(error, str):
+                message = message or error
+    except ValueError:
+        message = response.text[:300].strip()
+    if code == "quota_not_enough" or "quota" in message.lower():
+        return TransportError("ToAPIs 账户额度不足，请充值或补充额度后重试")
+    detail = f"：{message}" if message else ""
+    return TransportError(f"API 请求被拒绝（HTTP {response.status_code}）{detail}")
+
+
 def _request_json(
     method: str,
     url: str,
@@ -72,12 +95,20 @@ def _request_json(
     for attempt in range(retries):
         try:
             response = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
-            response.raise_for_status()
+            if response.status_code >= 400:
+                error = _http_error(response)
+                # Authentication, permission, quota, and invalid requests should
+                # not be repeated; retries cannot change these provider decisions.
+                if response.status_code < 500 and response.status_code != 429:
+                    raise error
+                raise requests.HTTPError(str(error), response=response)
             payload = response.json()
             if not isinstance(payload, dict):
                 raise TransportError("API 返回不是 JSON 对象")
             return payload
-        except (requests.RequestException, ValueError, TransportError) as exc:
+        except TransportError:
+            raise
+        except (requests.RequestException, ValueError) as exc:
             last_error = exc
             if attempt + 1 < retries:
                 # Exponential backoff avoids hammering a rate-limited endpoint.

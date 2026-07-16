@@ -7,9 +7,11 @@ from cascadeforge.sanitize import sanitize_image
 
 
 class FakeResponse:
-    def __init__(self, payload, fail=False):
+    def __init__(self, payload, fail=False, status_code=200):
         self.payload = payload
         self.fail = fail
+        self.status_code = status_code
+        self.text = ""
 
     def raise_for_status(self):
         if self.fail:
@@ -24,12 +26,31 @@ def test_request_json_retries(monkeypatch):
 
     def fake_request(*args, **kwargs):
         calls.append((args, kwargs))
-        return FakeResponse({"ok": True}, fail=len(calls) == 1)
+        return FakeResponse(
+            {"message": "temporary"} if len(calls) == 1 else {"ok": True},
+            status_code=500 if len(calls) == 1 else 200,
+        )
 
     monkeypatch.setattr(editor.requests, "request", fake_request)
     monkeypatch.setattr(editor.time, "sleep", lambda _: None)
     assert editor._request_json("GET", "https://example.invalid") == {"ok": True}
     assert len(calls) == 2
+
+
+def test_request_json_reports_quota_without_retry(monkeypatch):
+    calls = []
+
+    def fake_request(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeResponse(
+            {"code": "quota_not_enough", "message": "user quota is not enough"},
+            status_code=403,
+        )
+
+    monkeypatch.setattr(editor.requests, "request", fake_request)
+    with pytest.raises(editor.TransportError, match="账户额度不足"):
+        editor._request_json("POST", "https://example.invalid")
+    assert len(calls) == 1
 
 
 def test_extract_nested_result_url_with_top_level_task_id():
