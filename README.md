@@ -85,7 +85,12 @@ OUTPUT/AC_multi_object/{digest}/
 ├── ROUND_2.jpg
 ├── ROUND_3.jpg
 └── ROUND_4.jpg
+
+OUTPUT/提示词/
+└── {digest}.json
 ```
+
+`IMAGE_MASK/JSON/` 保存全部已生成的提示词；`OUTPUT/提示词/` 只保存存在正式结果图的提示词，文件名统一为 `{digest}.json`。
 
 ## 脱敏与发布边界
 

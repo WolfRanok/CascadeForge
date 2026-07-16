@@ -8,7 +8,7 @@ from PIL import Image
 
 import cascadeforge.select as selection_module
 from cascadeforge.config import load_config
-from cascadeforge.organize import split_grid
+from cascadeforge.organize import run_organize, split_grid
 from cascadeforge.preprocess import crop_size, iou, select_candidates
 from cascadeforge.select import (
     PROMPT,
@@ -253,6 +253,47 @@ def test_organize_splits_grid(tmp_path):
     ok, digest, message = split_grid(edited, tmp_path / "out", source)
     assert ok and digest == "abc"
     assert (tmp_path / "out" / "abc" / "ROUND_4.jpg").exists()
+
+
+def test_organize_copies_only_prompts_for_formal_results(tmp_path):
+    root = tmp_path / "IMAGE_MASK"
+    edited_dir = root / "EDITED_4K"
+    json_dir = root / "JSON"
+    source_dir = root / "IMAGE_2"
+    for directory in (edited_dir, json_dir, source_dir):
+        directory.mkdir(parents=True)
+    for digest in ("ok1", "ok2", "failed"):
+        Image.new("RGB", (8, 8), "white").save(edited_dir / f"{digest}_gpt_edited.jpg")
+        Image.new("RGB", (4, 4), "white").save(source_dir / f"{digest}.jpg")
+        (json_dir / f"{digest}_JSON_gpt.json").write_text(
+            json.dumps({"ROUND_1": {"long": digest}}), encoding="utf-8"
+        )
+    output_dir = tmp_path / "OUTPUT" / "AC_multi_object"
+    prompt_dir = tmp_path / "OUTPUT" / "提示词"
+    (prompt_dir / "stale.json").parent.mkdir(parents=True)
+    (prompt_dir / "stale.json").write_text("{}", encoding="utf-8")
+    # Only these two images represent successful edit results for this run.
+    (edited_dir / "failed_gpt_edited.jpg").unlink()
+
+    assert run_organize(edited_dir, output_dir, source_dir, workers=1) == 0
+    assert sorted(path.name for path in prompt_dir.glob("*.json")) == ["ok1.json", "ok2.json"]
+    assert (output_dir / "ok1" / "ROUND_4.jpg").exists()
+    assert (output_dir / "ok2" / "ROUND_4.jpg").exists()
+    assert not (prompt_dir / "ok1_JSON_gpt.json").exists()
+
+
+def test_organize_skips_result_without_prompt_and_returns_failure(tmp_path):
+    root = tmp_path / "IMAGE_MASK"
+    edited_dir = root / "EDITED_4K"
+    source_dir = root / "IMAGE_2"
+    edited_dir.mkdir(parents=True)
+    source_dir.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "white").save(edited_dir / "missing_gpt_edited.jpg")
+    Image.new("RGB", (4, 4), "white").save(source_dir / "missing.jpg")
+
+    output_dir = tmp_path / "OUTPUT" / "AC_multi_object"
+    assert run_organize(edited_dir, output_dir, source_dir, workers=1) == 1
+    assert not (output_dir / "missing").exists()
 
 
 def test_config_environment_overrides_local(tmp_path, monkeypatch):
