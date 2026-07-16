@@ -433,8 +433,8 @@ def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "
     mask_path = input_root / "MASK" / f"{digest}_MASK.png"
     output_path = input_root / "EDITED_4K" / f"{digest}_{model}_edited.jpg"
     raw_path = input_root / "EDITED_4K" / f"{digest}_{model}_edited_raw.jpg"
-    rejected_path = input_root / "EDITED_4K" / "REJECTED" / f"{digest}_{model}_edited.jpg"
     download_json = input_root / "DOWNLOAD_JSON" / f"{digest}_{model}_url.json"
+    candidate_path = input_root / ".cascadeforge" / "candidates" / f"{digest}.jpg"
     result: dict[str, Any] = {"md5": digest, "model": model, "status": "error"}
     if output_path.exists():
         result["status"] = "skip"
@@ -506,7 +506,6 @@ def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "
                 raise TransportError("缺少可恢复的图片 URL")
             _download(url, raw_path)
 
-        candidate_path = input_root / ".cascadeforge" / "candidates" / f"{digest}.jpg"
         passed, metrics = compose_and_measure(input_root, digest, raw_path, candidate_path)
         quality_path = _quality_path(input_root, digest)
         quality_path.parent.mkdir(parents=True, exist_ok=True)
@@ -518,17 +517,25 @@ def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "
         }
         quality_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         if not passed:
-            rejected_path.parent.mkdir(parents=True, exist_ok=True)
-            rejected_path.write_bytes(candidate_path.read_bytes())
+            # Keep only the small terminal marker; failed images are not retained.
+            raw_path.unlink(missing_ok=True)
+            candidate_path.unlink(missing_ok=True)
+            download_json.unlink(missing_ok=True)
             result["status"] = "rejected"
             failed_rounds = [str(item["round"]) for item in metrics if not item["passed"]]
             result["error"] = f"质量门禁未通过：ROUND_{'、'.join(failed_rounds)}"
             return result
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(candidate_path.read_bytes())
+        # Raw/provider and candidate files are temporary once the final result exists.
+        raw_path.unlink(missing_ok=True)
+        candidate_path.unlink(missing_ok=True)
         result["status"] = "success"
         result["output"] = str(output_path)
     except Exception as exc:
+        # A transport or composition failure must not leave misleading image results.
+        raw_path.unlink(missing_ok=True)
+        candidate_path.unlink(missing_ok=True)
         result["error"] = str(exc)[:500]
     return result
 
