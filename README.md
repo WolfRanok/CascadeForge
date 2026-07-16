@@ -28,6 +28,10 @@ flowchart LR
     F --> G[ROUND_1~4 + original]
 ```
 
+![Cumulative mask progression](docs/assets/cascadeforge-masks.png)
+
+上图为原创示意图：四个面板对应从单层到四层的累计 Mask，不代表仓库内的真实数据样例。
+
 ## 快速开始
 
 ```powershell
