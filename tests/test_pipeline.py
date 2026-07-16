@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import cascadeforge.select as selection_module
 from cascadeforge.config import load_config
 from cascadeforge.organize import split_grid
 from cascadeforge.preprocess import crop_size, iou, select_candidates
@@ -28,8 +29,8 @@ def test_selection_prompt_preserves_short_and_long_length_rules():
     assert "short 均不超过 10 个汉字" in PROMPT
     assert "long 均为 15–30 个汉字" in PROMPT
     assert "明显、高对比、容易识别" in PROMPT
-    assert "目标 + 原状态 + 新状态" in PROMPT
-    assert "轻微改变" in PROMPT
+    assert "位置和外观明确的目标，清晰变化" in PROMPT
+    assert "左上部的白色蘑菇，尺寸明显变大一倍" in PROMPT
 
 
 def test_iou_and_candidate_filter_remove_nested_masks():
@@ -176,6 +177,52 @@ def test_old_selection_is_regenerated_and_invalid_choice_retried(tmp_path):
     assert ok
     assert completions.calls == 2
     assert is_current_selection(root / "SELECTION" / f"{digest}_selection.json")
+
+
+def test_run_selection_processes_new_rounds_and_does_not_repeat_failure(
+    tmp_path, monkeypatch, capsys
+):
+    root = tmp_path / "IMAGE_MASK"
+    candidate_dir = root / "CANDIDATES"
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "first_meta.json").write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(
+        vision=SimpleNamespace(api_key="test-key", base_url="https://example.invalid", model="mock")
+    )
+    monkeypatch.setattr(selection_module, "load_config", lambda _: config)
+    monkeypatch.setattr(selection_module, "OpenAI", lambda **_: object())
+    sleeps = []
+    monkeypatch.setattr(selection_module.time, "sleep", sleeps.append)
+    calls = []
+
+    def fake_process(meta_path, output_root, client, model):
+        digest = meta_path.name.removesuffix("_meta.json")
+        calls.append(digest)
+        if digest == "first":
+            # Simulate preprocessing producing another item during this round.
+            (candidate_dir / "second_meta.json").write_text("{}", encoding="utf-8")
+            return True, digest, "ok"
+        return False, digest, "failed after internal retries"
+
+    monkeypatch.setattr(selection_module, "process_one", fake_process)
+    code = selection_module.run_selection(root, None, concurrency=1)
+
+    assert code == 1
+    assert calls == ["first", "second"]
+    assert sleeps == [3]
+    output = capsys.readouterr().out
+    assert "第 2 轮" in output
+    assert "成功 1，失败 1" in output
+
+
+def test_run_selection_preserves_empty_directory_error(tmp_path, monkeypatch):
+    root = tmp_path / "IMAGE_MASK"
+    (root / "CANDIDATES").mkdir(parents=True)
+    config = SimpleNamespace(
+        vision=SimpleNamespace(api_key="test-key", base_url="https://example.invalid", model="mock")
+    )
+    monkeypatch.setattr(selection_module, "load_config", lambda _: config)
+    assert selection_module.run_selection(root, None) == 1
 
 
 def test_organize_splits_grid(tmp_path):

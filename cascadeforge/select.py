@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -254,6 +255,22 @@ def process_one(meta_path: Path, output_root: Path, client: OpenAI, model: str):
         return False, digest, str(exc)[:300]
 
 
+def pending_metadata(output_root: Path, attempted: set[str]) -> list[Path]:
+    """Find new, incomplete metadata files that were not attempted in this run."""
+    pending: list[Path] = []
+    for meta_path in sorted((output_root / "CANDIDATES").glob("*_meta.json")):
+        digest = meta_path.name.removesuffix("_meta.json")
+        if digest in attempted:
+            continue
+        json_path = output_root / "JSON" / f"{digest}_JSON_gpt.json"
+        mask_path = output_root / "MASK" / f"{digest}_MASK.png"
+        selection_path = output_root / "SELECTION" / f"{digest}_selection.json"
+        if json_path.exists() and mask_path.exists() and is_current_selection(selection_path):
+            continue
+        pending.append(meta_path)
+    return pending
+
+
 def run_selection(output_root: Path, config_path: Path | None, concurrency: int = 8) -> int:
     config = load_config(config_path)
     if not config.vision.api_key:
@@ -265,12 +282,44 @@ def run_selection(output_root: Path, config_path: Path | None, concurrency: int 
         print(f"[错误] {candidate_dir} 中没有候选元数据")
         return 1
     client = OpenAI(api_key=config.vision.api_key, base_url=config.vision.base_url)
-    failures = 0
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        results = pool.map(
-            lambda path: process_one(path, output_root, client, config.vision.model), metadata_files
+    attempted: set[str] = set()
+    total_successes = 0
+    total_failures = 0
+    round_number = 0
+    idle_scans = 0
+
+    while True:
+        pending = pending_metadata(output_root, attempted)
+        if not pending:
+            idle_scans += 1
+            if idle_scans >= 2:
+                print(
+                    f"[完成] 共处理 {round_number} 轮：成功 {total_successes}，"
+                    f"失败 {total_failures}"
+                )
+                return 1 if total_failures else 0
+            print("[INFO] 暂无新增候选，3 秒后再次确认")
+            time.sleep(3)
+            continue
+
+        idle_scans = 0
+        round_number += 1
+        # Mark before dispatch so a failed item cannot loop forever in this run.
+        attempted.update(path.name.removesuffix("_meta.json") for path in pending)
+        print(f"[INFO] 第 {round_number} 轮发现 {len(pending)} 个待处理任务")
+        round_successes = 0
+        round_failures = 0
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+            results = pool.map(
+                lambda path: process_one(path, output_root, client, config.vision.model), pending
+            )
+            for ok, digest, message in results:
+                print(f"[{'成功' if ok else '错误'}] {digest}: {message}")
+                round_successes += bool(ok)
+                round_failures += not ok
+        total_successes += round_successes
+        total_failures += round_failures
+        print(
+            f"[INFO] 第 {round_number} 轮完成：成功 {round_successes}，失败 {round_failures}；"
+            "正在检查新增内容"
         )
-        for ok, digest, message in results:
-            print(f"[{'成功' if ok else '错误'}] {digest}: {message}")
-            failures += not ok
-    return 1 if failures else 0
