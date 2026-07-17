@@ -22,11 +22,13 @@ from .config import AppConfig, load_config
 
 SUCCESS_STATUSES = {"completed", "succeeded", "success"}
 FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
-PIPELINE_VERSION = "four-target-independent-v1"
+PIPELINE_VERSION = "four-target-cropped-v1"
 SELECTION_MODE = "four-target-independent-v1"
 LEGACY_GLOBAL_MODE = "three-target-global-v3-independent"
 MIN_MEAN_DIFFERENCE = 18.0
 MIN_CHANGED_RATIO = 0.25
+CROP_PADDING_RATIO = 0.35
+MIN_CROP_PADDING = 32
 SUPPORTED_RATIOS = {
     "16:9": 16 / 9,
     "9:16": 9 / 16,
@@ -46,17 +48,17 @@ SUPPORTED_RATIOS = {
 
 def build_prompt_from_json(data: dict[str, Any]) -> str:
     rounds = [data.get(f"ROUND_{index}", {}).get("long", "") for index in range(1, 5)]
-    return f"""这是同一张原图组成的 2×2 四宫格。四格是独立任务。
+    return f"""这是四个目标局部近景组成的 2×2 四宫格。四格是独立任务。
 
-左上：只编辑透明 Mask 内的物体：{rounds[0]}
-右上：只编辑透明 Mask 内的物体：{rounds[1]}
-左下：只编辑透明 Mask 内的物体：{rounds[2]}
-右下：只编辑透明 Mask 内的物体：{rounds[3]}
+左上局部近景：只编辑透明 Mask 内的目标：{rounds[0]}
+右上局部近景：只编辑透明 Mask 内的目标：{rounds[1]}
+左下局部近景：只编辑透明 Mask 内的目标：{rounds[2]}
+右下局部近景：只编辑透明 Mask 内的目标：{rounds[3]}
 
 规则：
 1. 四格互不依赖，每格只完成自己的一项编辑。
-2. 透明 Mask 是唯一目标位置；忽略指令中可能不准确的位置词。
-3. Mask 内变化必须明显，Mask 外保持原图。
+2. 每格都是局部裁剪，透明 Mask 是唯一目标位置；忽略指令中可能不准确的位置词。
+3. Mask 内变化必须明显，Mask 外和周围上下文保持原图。
 4. 保持物体轮廓、姿态、位置和数量不变。
 5. 四格都禁止改变整图天气、昼夜、季节、光照、氛围和整体色调。
 6. 禁止编号、文字、标签、边框、水印、UI、额外物体和跨象限修改。"""
@@ -206,39 +208,95 @@ def _target_masks(input_root: Path, digest: str) -> list[np.ndarray]:
     return targets
 
 
-def materialize_upload_mask(input_root: Path, digest: str) -> Path:
-    """Build and validate the independent four-quadrant mask sent to the API."""
-    image_path = input_root / "IMAGE_2X4" / f"{digest}_IMAGE.jpg"
-    source_mask = input_root / "MASK" / f"{digest}_MASK.png"
-    with Image.open(image_path) as image_source, Image.open(source_mask) as mask_source:
-        image = image_source.convert("RGB")
-        if mask_source.mode != "RGBA":
-            raise TransportError("Mask 必须是带 Alpha 通道的 RGBA PNG")
-        if mask_source.size != image.size:
-            raise TransportError(
-                f"Mask 尺寸 {mask_source.size} 与四宫格原图尺寸 {image.size} 不一致"
-            )
+def _crop_layout(
+    input_root: Path, digest: str
+) -> tuple[tuple[int, int], list[tuple[int, int, int, int]], list[np.ndarray]]:
+    """Return one shared-size context crop for each independent target."""
+    original_path = input_root / "IMAGE_2" / f"{digest}.jpg"
+    with Image.open(original_path) as source:
+        image_size = source.size
+    width, height = image_size
     targets = _target_masks(input_root, digest)
     if len(targets) != 4 or any(not target.any() for target in targets):
         raise TransportError("四个象限必须各自包含一个非空目标 Mask")
-    height, width = targets[0].shape
-    if image.size != (width * 2, height * 2):
-        raise TransportError("目标 Mask 象限尺寸与四宫格原图不一致")
+    if any(target.shape != (height, width) for target in targets):
+        raise TransportError("目标 Mask 尺寸必须与标准化原图一致")
 
-    regions = targets
-    image_array = np.asarray(image)
-    output = Image.new("RGBA", image.size, (0, 0, 0, 255))
-    counts: list[int] = []
-    for region, box in zip(regions, _quadrant_boxes(*image.size)):
-        x0, y0, x1, y1 = box
-        alpha = np.where(region, 0, 255).astype(np.uint8)
-        tile = np.dstack((image_array[y0:y1, x0:x1], alpha)).astype(np.uint8)
-        output.paste(Image.fromarray(tile, "RGBA"), (x0, y0))
-        counts.append(int(region.sum()))
-    destination = input_root / ".cascadeforge" / "upload_masks" / f"{digest}_MASK.png"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    output.save(destination, "PNG", optimize=True)
-    return destination
+    bounds: list[tuple[int, int, int, int]] = []
+    required_width = 1
+    required_height = 1
+    for target in targets:
+        ys, xs = np.where(target)
+        left, right = int(xs.min()), int(xs.max()) + 1
+        top, bottom = int(ys.min()), int(ys.max()) + 1
+        bbox_width, bbox_height = right - left, bottom - top
+        padding_x = max(MIN_CROP_PADDING, int(round(bbox_width * CROP_PADDING_RATIO)))
+        padding_y = max(MIN_CROP_PADDING, int(round(bbox_height * CROP_PADDING_RATIO)))
+        bounds.append((left, top, right, bottom))
+        required_width = max(required_width, min(width, bbox_width + 2 * padding_x))
+        required_height = max(required_height, min(height, bbox_height + 2 * padding_y))
+
+    # Preserve the original aspect ratio so the final four full-frame rounds
+    # keep the same geometry after the provider returns the crop grid.
+    aspect = width / max(1, height)
+    if required_width / max(1, required_height) < aspect:
+        required_width = int(np.ceil(required_height * aspect))
+    else:
+        required_height = int(np.ceil(required_width / aspect))
+    if required_width > width or required_height > height:
+        crop_width, crop_height = width, height
+    else:
+        crop_width, crop_height = required_width, required_height
+
+    crop_boxes: list[tuple[int, int, int, int]] = []
+    for left, top, right, bottom in bounds:
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        x0 = min(max(0, int(round(center_x - crop_width / 2))), width - crop_width)
+        y0 = min(max(0, int(round(center_y - crop_height / 2))), height - crop_height)
+        crop_boxes.append((x0, y0, x0 + crop_width, y0 + crop_height))
+    return (crop_width, crop_height), crop_boxes, targets
+
+
+def materialize_edit_inputs(input_root: Path, digest: str) -> tuple[Path, Path]:
+    """Build the cropped image grid and its aligned RGBA mask for upload."""
+    original_path = input_root / "IMAGE_2" / f"{digest}.jpg"
+    source_mask = input_root / "MASK" / f"{digest}_MASK.png"
+    with Image.open(original_path) as image_source, Image.open(source_mask) as mask_source:
+        image = image_source.convert("RGB")
+        if mask_source.mode != "RGBA":
+            raise TransportError("Mask 必须是带 Alpha 通道的 RGBA PNG")
+    tile_size, crop_boxes, targets = _crop_layout(input_root, digest)
+    crop_width, crop_height = tile_size
+    grid_size = (crop_width * 2, crop_height * 2)
+    image_grid = Image.new("RGB", grid_size)
+    mask_grid = Image.new("RGBA", grid_size, (0, 0, 0, 255))
+
+    for target, crop_box, destination_box in zip(
+        targets, crop_boxes, _quadrant_boxes(*grid_size)
+    ):
+        left, top, right, bottom = crop_box
+        crop = image.crop(crop_box)
+        target_crop = target[top:bottom, left:right]
+        alpha = np.where(target_crop, 0, 255).astype(np.uint8)
+        rgba_crop = np.dstack((np.asarray(crop), alpha)).astype(np.uint8)
+        x0, y0, _, _ = destination_box
+        image_grid.paste(crop, (x0, y0))
+        mask_grid.paste(Image.fromarray(rgba_crop, "RGBA"), (x0, y0))
+
+    destination_dir = input_root / ".cascadeforge" / "edit_inputs"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    image_path = destination_dir / f"{digest}_IMAGE.jpg"
+    mask_path = destination_dir / f"{digest}_MASK.png"
+    image_grid.save(image_path, "JPEG", quality=95, subsampling=0)
+    mask_grid.save(mask_path, "PNG", optimize=True)
+    return image_path, mask_path
+
+
+def materialize_upload_mask(input_root: Path, digest: str) -> Path:
+    """Compatibility helper returning the cropped mask upload path."""
+    _, mask_path = materialize_edit_inputs(input_root, digest)
+    return mask_path
 
 
 def verify_remote_mask(url: str, local_path: Path) -> dict[str, Any]:
@@ -283,10 +341,26 @@ def _is_rejected(input_root: Path, digest: str) -> bool:
     return state.get("version") == PIPELINE_VERSION and state.get("passed") is False
 
 
+def _load_current_download_cache(download_json: Path, raw_path: Path) -> str | None:
+    """Return a current URL and discard raw output from older pipelines."""
+    cached_version = ""
+    url: str | None = None
+    if download_json.exists():
+        cached = json.loads(download_json.read_text(encoding="utf-8"))
+        cached_version = str(cached.get("pipeline_version", ""))
+        if cached_version == PIPELINE_VERSION and isinstance(cached.get("url"), str):
+            url = cached["url"]
+    # Raw images have no embedded pipeline version, so their URL sidecar is
+    # required before they can safely be reused for crop-coordinate mapping.
+    if raw_path.exists() and cached_version != PIPELINE_VERSION:
+        raw_path.unlink(missing_ok=True)
+    return url
+
+
 def compose_and_measure(
     input_root: Path, digest: str, raw_path: Path, destination: Path
 ) -> tuple[bool, list[dict[str, Any]]]:
-    """Accumulate four independent edits and enforce every protected pixel locally."""
+    """Map four complete edited crops back while preserving earlier targets."""
     original_path = input_root / "IMAGE_2" / f"{digest}.jpg"
     with Image.open(raw_path) as raw_source, Image.open(original_path) as original_source:
         generated = raw_source.convert("RGB")
@@ -294,34 +368,34 @@ def compose_and_measure(
         if width % 2 or height % 2 or width < 2 or height < 2:
             raise TransportError(f"编辑结果不是有效四宫格尺寸：{generated.size}")
         quadrant_size = (width // 2, height // 2)
-        original = original_source.convert("RGB").resize(
-            quadrant_size, Image.Resampling.LANCZOS
-        )
+        original = original_source.convert("RGB")
         original_array = np.asarray(original).copy()
         generated_array = np.asarray(generated)
-        masks = [
-            np.asarray(
-                Image.fromarray(mask.astype(np.uint8) * 255).resize(
-                    quadrant_size, Image.Resampling.NEAREST
-                )
-            )
-            > 128
-            for mask in _target_masks(input_root, digest)
-        ]
+        tile_size, crop_boxes, targets = _crop_layout(input_root, digest)
 
         frames: list[np.ndarray] = []
         metrics: list[dict[str, Any]] = []
         previous = original_array.copy()
-        for index, (mask, box) in enumerate(
-            zip(masks, _quadrant_boxes(width, height)), 1
+        for index, (target, crop_box, quadrant_box) in enumerate(
+            zip(targets, crop_boxes, _quadrant_boxes(width, height)), 1
         ):
-            x0, y0, x1, y1 = box
-            model_frame = generated_array[y0:y1, x0:x1]
+            qx0, qy0, qx1, qy1 = quadrant_box
+            model_frame = generated_array[qy0:qy1, qx0:qx1]
+            model_crop = np.asarray(
+                Image.fromarray(model_frame, "RGB").resize(
+                    tile_size, Image.Resampling.LANCZOS
+                )
+            )
+            left, top, right, bottom = crop_box
+            target_crop = target[top:bottom, left:right]
+            original_crop = original_array[top:bottom, left:right]
             pixel_difference = np.abs(
-                model_frame.astype(np.int16) - original_array.astype(np.int16)
+                model_crop.astype(np.int16) - original_crop.astype(np.int16)
             ).mean(axis=2)
-            mean_difference = float(pixel_difference[mask].mean())
-            changed_ratio = float((pixel_difference[mask] >= MIN_MEAN_DIFFERENCE).mean())
+            mean_difference = float(pixel_difference[target_crop].mean())
+            changed_ratio = float(
+                (pixel_difference[target_crop] >= MIN_MEAN_DIFFERENCE).mean()
+            )
             passed = (
                 mean_difference >= MIN_MEAN_DIFFERENCE
                 and changed_ratio >= MIN_CHANGED_RATIO
@@ -329,20 +403,31 @@ def compose_and_measure(
             metrics.append(
                 {
                     "round": index,
-                    "target_pixels": int(mask.sum()),
+                    "target_pixels": int(target_crop.sum()),
                     "mean_difference": round(mean_difference, 3),
                     "changed_ratio": round(changed_ratio, 4),
                     "passed": passed,
                 }
             )
             current = previous.copy()
-            current[mask] = model_frame[mask]
+            current_crop = model_crop.copy()
+            previous_crop = previous[top:bottom, left:right]
+            # A complete crop is pasted so target motion or outline expansion
+            # is not clipped by the original segmentation boundary. If crop
+            # boxes overlap, earlier edited targets still remain cumulative.
+            for previous_target in targets[: index - 1]:
+                protected = previous_target[top:bottom, left:right]
+                current_crop[protected] = previous_crop[protected]
+            current[top:bottom, left:right] = current_crop
             frames.append(current)
             previous = current
 
         composed = Image.new("RGB", generated.size)
         for frame, box in zip(frames, _quadrant_boxes(width, height)):
-            composed.paste(Image.fromarray(frame, "RGB"), (box[0], box[1]))
+            full_frame = Image.fromarray(frame, "RGB").resize(
+                quadrant_size, Image.Resampling.LANCZOS
+            )
+            composed.paste(full_frame, (box[0], box[1]))
         destination.parent.mkdir(parents=True, exist_ok=True)
         composed.save(destination, "JPEG", quality=95, subsampling=0)
     return all(metric["passed"] for metric in metrics), metrics
@@ -424,40 +509,43 @@ def _poll(task_id: str, config: AppConfig) -> str:
 
 def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "gpt") -> dict[str, Any]:
     json_path = input_root / "JSON" / f"{digest}_JSON_gpt.json"
-    image_path = input_root / "IMAGE_2X4" / f"{digest}_IMAGE.jpg"
+    original_path = input_root / "IMAGE_2" / f"{digest}.jpg"
     mask_path = input_root / "MASK" / f"{digest}_MASK.png"
     output_path = input_root / "EDITED_4K" / f"{digest}_{model}_edited.jpg"
     raw_path = input_root / "EDITED_4K" / f"{digest}_{model}_edited_raw.jpg"
     download_json = input_root / "DOWNLOAD_JSON" / f"{digest}_{model}_url.json"
     candidate_path = input_root / ".cascadeforge" / "candidates" / f"{digest}.jpg"
+    edit_input_dir = input_root / ".cascadeforge" / "edit_inputs"
+    edit_image_path = edit_input_dir / f"{digest}_IMAGE.jpg"
+    edit_mask_path = edit_input_dir / f"{digest}_MASK.png"
     result: dict[str, Any] = {"md5": digest, "model": model, "status": "error"}
     if output_path.exists():
+        edit_image_path.unlink(missing_ok=True)
+        edit_mask_path.unlink(missing_ok=True)
         result["status"] = "skip"
         return result
     if _is_rejected(input_root, digest):
+        edit_image_path.unlink(missing_ok=True)
+        edit_mask_path.unlink(missing_ok=True)
         result["status"] = "rejected"
         result["error"] = "质量门禁未通过；删除本地 quality sidecar 后可人工重试"
         return result
-    if not json_path.exists() or not image_path.exists() or not mask_path.exists():
-        result["error"] = "缺少提示词 JSON、四宫格原图或累计 Mask"
+    if not json_path.exists() or not original_path.exists() or not mask_path.exists():
+        result["error"] = "缺少提示词 JSON、标准化原图或独立目标 Mask"
         return result
     try:
-        url = None
-        if download_json.exists():
-            cached = json.loads(download_json.read_text(encoding="utf-8"))
-            if cached.get("pipeline_version") == PIPELINE_VERSION:
-                url = cached.get("url")
+        url = _load_current_download_cache(download_json, raw_path)
         if not raw_path.exists() and not url:
-            upload_mask = materialize_upload_mask(input_root, digest)
-            image_url = _upload(image_path, config)
-            mask_url = _upload(upload_mask, config)
-            mask_stats = verify_remote_mask(mask_url, upload_mask)
+            edit_image_path, edit_mask_path = materialize_edit_inputs(input_root, digest)
+            image_url = _upload(edit_image_path, config)
+            mask_url = _upload(edit_mask_path, config)
+            mask_stats = verify_remote_mask(mask_url, edit_mask_path)
             print(
                 f"[MASK-OK] {digest}: {mask_stats['size'][0]}x{mask_stats['size'][1]}，"
                 f"透明像素 {mask_stats['transparent_pixels']}"
             )
             prompt = build_prompt_from_json(json.loads(json_path.read_text(encoding="utf-8")))
-            with Image.open(image_path) as source:
+            with Image.open(edit_image_path) as source:
                 width, height = source.size
             ratio = min(
                 SUPPORTED_RATIOS,
@@ -516,6 +604,8 @@ def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "
             raw_path.unlink(missing_ok=True)
             candidate_path.unlink(missing_ok=True)
             download_json.unlink(missing_ok=True)
+            edit_image_path.unlink(missing_ok=True)
+            edit_mask_path.unlink(missing_ok=True)
             result["status"] = "rejected"
             failed_rounds = [str(item["round"]) for item in metrics if not item["passed"]]
             result["error"] = f"质量门禁未通过：ROUND_{'、'.join(failed_rounds)}"
@@ -525,12 +615,16 @@ def process_one(digest: str, input_root: Path, config: AppConfig, model: str = "
         # Raw/provider and candidate files are temporary once the final result exists.
         raw_path.unlink(missing_ok=True)
         candidate_path.unlink(missing_ok=True)
+        edit_image_path.unlink(missing_ok=True)
+        edit_mask_path.unlink(missing_ok=True)
         result["status"] = "success"
         result["output"] = str(output_path)
     except Exception as exc:
         # A transport or composition failure must not leave misleading image results.
         raw_path.unlink(missing_ok=True)
         candidate_path.unlink(missing_ok=True)
+        edit_image_path.unlink(missing_ok=True)
+        edit_mask_path.unlink(missing_ok=True)
         result["error"] = str(exc)[:500]
     return result
 
