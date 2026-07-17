@@ -30,7 +30,9 @@ def test_selection_prompt_preserves_short_and_long_length_rules():
     assert "short 均不超过 10 个汉字" in PROMPT
     assert "long 均为 15–30 个汉字" in PROMPT
     assert "明显、高对比、容易识别" in PROMPT
-    assert "位置和外观明确的目标，清晰变化" in PROMPT
+    assert "位置和当前外观明确的目标，清晰变化" in PROMPT
+    assert "新状态必须不同" in PROMPT
+    assert "蓝色物体改成蓝色" in PROMPT
     assert "左上部的白色蘑菇，尺寸明显变大一倍" in PROMPT
 
 

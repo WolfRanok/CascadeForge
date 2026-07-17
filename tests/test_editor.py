@@ -134,17 +134,17 @@ def _make_independent_crop_root(tmp_path):
     return root, digest, targets
 
 
-def test_crop_layout_has_shared_context_boxes_and_keeps_targets_inside(tmp_path, monkeypatch):
+def test_crop_layout_has_independent_context_boxes_and_keeps_targets_inside(tmp_path, monkeypatch):
     monkeypatch.setattr(editor, "MIN_CROP_PADDING", 2)
     monkeypatch.setattr(editor, "CROP_PADDING_RATIO", 0.2)
     root, digest, targets = _make_independent_crop_root(tmp_path)
     tile_size, boxes, masks = editor._crop_layout(root, digest)
     assert len(set(boxes)) == 4
-    assert all((right - left, bottom - top) == tile_size for left, top, right, bottom in boxes)
+    assert tile_size == (20, 20)
     for mask, (left, top, right, bottom), (x, y) in zip(masks, boxes, targets):
         assert left <= x < right and top <= y < bottom
         assert right <= 20 and bottom <= 20
-    assert tile_size[0] < 20 and tile_size[1] < 20
+    assert all((right - left) < 20 and (bottom - top) < 20 for left, top, right, bottom in boxes)
 
 
 def test_materialize_edit_inputs_creates_cropped_image_and_mask(tmp_path, monkeypatch):
@@ -160,7 +160,48 @@ def test_materialize_edit_inputs_creates_cropped_image_and_mask(tmp_path, monkey
                      alpha[0:alpha.shape[0] // 2, alpha.shape[1] // 2:],
                      alpha[alpha.shape[0] // 2:, 0:alpha.shape[1] // 2],
                      alpha[alpha.shape[0] // 2:, alpha.shape[1] // 2:]]
-        assert [int(item.sum()) for item in quadrants] == [1, 1, 1, 1]
+        counts = [int(item.sum()) for item in quadrants]
+        assert all(0 < count < item.size for count, item in zip(counts, quadrants))
+        assert set(np.unique(mask.getchannel("A"))).issubset({0, 255})
+
+
+def test_large_target_does_not_force_small_targets_to_full_image(tmp_path, monkeypatch):
+    monkeypatch.setattr(editor, "MIN_CROP_PADDING", 4)
+    root = tmp_path / "LARGE_TARGET_IMAGE_MASK"
+    for name in ("IMAGE_2", "MASK", "SELECTION"):
+        (root / name).mkdir(parents=True)
+    digest = "mixed"
+    width, height = 100, 60
+    Image.new("RGB", (width, height), "gray").save(root / "IMAGE_2" / f"{digest}.jpg")
+    target_masks = []
+    large = np.zeros((height, width), dtype=bool)
+    large[2:58, 5:95] = True
+    target_masks.append(large)
+    for x, y in ((10, 10), (80, 10), (50, 45)):
+        small = np.zeros((height, width), dtype=bool)
+        small[y : y + 3, x : x + 3] = True
+        target_masks.append(small)
+    mask_grid = Image.new("RGBA", (width * 2, height * 2), (0, 0, 0, 255))
+    for index, target in enumerate(target_masks):
+        alpha = np.where(target, 0, 255).astype(np.uint8)
+        tile = Image.new("RGBA", (width, height), (128, 128, 128, 255))
+        tile.putalpha(Image.fromarray(alpha, "L"))
+        mask_grid.paste(tile, ((index % 2) * width, (index // 2) * height))
+    mask_grid.save(root / "MASK" / f"{digest}_MASK.png")
+    (root / "SELECTION" / f"{digest}_selection.json").write_text(
+        json.dumps({"selection_mode": editor.SELECTION_MODE}), encoding="utf-8"
+    )
+
+    tile_size, boxes, _ = editor._crop_layout(root, digest)
+
+    assert tile_size == (width, height)
+    coverage = [
+        ((right - left) * (bottom - top)) / (width * height)
+        for left, top, right, bottom in boxes
+    ]
+    assert coverage[0] == 1.0
+    assert all(value < 0.5 for value in coverage[1:])
+    assert len({(right - left, bottom - top) for left, top, right, bottom in boxes}) > 1
 
 
 def test_crop_paste_uses_soft_boundary_and_full_target(tmp_path):
@@ -266,7 +307,7 @@ def test_rejected_task_is_terminal_without_api_call(tmp_path, monkeypatch):
     quality = root / ".cascadeforge" / "quality" / "sample.json"
     quality.parent.mkdir(parents=True)
     quality.write_text(
-        '{"version":"four-target-cropped-v1","passed":false}', encoding="utf-8"
+        json.dumps({"version": editor.PIPELINE_VERSION, "passed": False}), encoding="utf-8"
     )
     monkeypatch.setattr(
         editor,

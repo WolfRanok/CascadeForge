@@ -22,8 +22,9 @@ from .config import AppConfig, load_config
 
 SUCCESS_STATUSES = {"completed", "succeeded", "success"}
 FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
-PIPELINE_VERSION = "four-target-cropped-v1"
-SELECTION_MODE = "four-target-independent-v1"
+PIPELINE_VERSION = "four-target-cropped-v2"
+SELECTION_MODE = "four-target-independent-v2"
+LEGACY_INDEPENDENT_MODE = "four-target-independent-v1"
 LEGACY_GLOBAL_MODE = "three-target-global-v3-independent"
 MIN_MEAN_DIFFERENCE = 18.0
 MIN_CHANGED_RATIO = 0.25
@@ -192,7 +193,7 @@ def _target_masks(input_root: Path, digest: str) -> list[np.ndarray]:
             )
         except (OSError, json.JSONDecodeError):
             pass
-    if mode == SELECTION_MODE:
+    if mode in {SELECTION_MODE, LEGACY_INDEPENDENT_MODE}:
         return [mask.astype(bool) for mask in quadrants]
     if mode == LEGACY_GLOBAL_MODE or quadrants[3].all():
         raise TransportError(
@@ -213,7 +214,7 @@ def _target_masks(input_root: Path, digest: str) -> list[np.ndarray]:
 def _crop_layout(
     input_root: Path, digest: str
 ) -> tuple[tuple[int, int], list[tuple[int, int, int, int]], list[np.ndarray]]:
-    """Return one shared-size context crop for each independent target."""
+    """Return four independent context crops and a common API tile size."""
     original_path = input_root / "IMAGE_2" / f"{digest}.jpg"
     with Image.open(original_path) as source:
         image_size = source.size
@@ -224,9 +225,8 @@ def _crop_layout(
     if any(target.shape != (height, width) for target in targets):
         raise TransportError("目标 Mask 尺寸必须与标准化原图一致")
 
-    bounds: list[tuple[int, int, int, int]] = []
-    required_width = 1
-    required_height = 1
+    crop_boxes: list[tuple[int, int, int, int]] = []
+    aspect = width / max(1, height)
     for target in targets:
         ys, xs = np.where(target)
         left, right = int(xs.min()), int(xs.max()) + 1
@@ -234,30 +234,23 @@ def _crop_layout(
         bbox_width, bbox_height = right - left, bottom - top
         padding_x = max(MIN_CROP_PADDING, int(round(bbox_width * CROP_PADDING_RATIO)))
         padding_y = max(MIN_CROP_PADDING, int(round(bbox_height * CROP_PADDING_RATIO)))
-        bounds.append((left, top, right, bottom))
-        required_width = max(required_width, min(width, bbox_width + 2 * padding_x))
-        required_height = max(required_height, min(height, bbox_height + 2 * padding_y))
-
-    # Preserve the original aspect ratio so the final four full-frame rounds
-    # keep the same geometry after the provider returns the crop grid.
-    aspect = width / max(1, height)
-    if required_width / max(1, required_height) < aspect:
-        required_width = int(np.ceil(required_height * aspect))
-    else:
-        required_height = int(np.ceil(required_width / aspect))
-    if required_width > width or required_height > height:
-        crop_width, crop_height = width, height
-    else:
-        crop_width, crop_height = required_width, required_height
-
-    crop_boxes: list[tuple[int, int, int, int]] = []
-    for left, top, right, bottom in bounds:
+        crop_width = min(width, bbox_width + 2 * padding_x)
+        crop_height = min(height, bbox_height + 2 * padding_y)
+        # Expand each target independently to the original aspect ratio. The
+        # API tiles can then share one size without distorting their crops.
+        if crop_width / max(1, crop_height) < aspect:
+            crop_width = min(width, int(np.ceil(crop_height * aspect)))
+        else:
+            crop_height = min(height, int(np.ceil(crop_width / aspect)))
+        if crop_width >= width or crop_height >= height:
+            crop_width, crop_height = width, height
         center_x = (left + right) / 2
         center_y = (top + bottom) / 2
         x0 = min(max(0, int(round(center_x - crop_width / 2))), width - crop_width)
         y0 = min(max(0, int(round(center_y - crop_height / 2))), height - crop_height)
         crop_boxes.append((x0, y0, x0 + crop_width, y0 + crop_height))
-    return (crop_width, crop_height), crop_boxes, targets
+    # The provider still receives equal quadrants; source crops differ.
+    return image_size, crop_boxes, targets
 
 
 def materialize_edit_inputs(input_root: Path, digest: str) -> tuple[Path, Path]:
@@ -269,8 +262,8 @@ def materialize_edit_inputs(input_root: Path, digest: str) -> tuple[Path, Path]:
         if mask_source.mode != "RGBA":
             raise TransportError("Mask 必须是带 Alpha 通道的 RGBA PNG")
     tile_size, crop_boxes, targets = _crop_layout(input_root, digest)
-    crop_width, crop_height = tile_size
-    grid_size = (crop_width * 2, crop_height * 2)
+    tile_width, tile_height = tile_size
+    grid_size = (tile_width * 2, tile_height * 2)
     image_grid = Image.new("RGB", grid_size)
     mask_grid = Image.new("RGBA", grid_size, (0, 0, 0, 255))
 
@@ -278,9 +271,17 @@ def materialize_edit_inputs(input_root: Path, digest: str) -> tuple[Path, Path]:
         targets, crop_boxes, _quadrant_boxes(*grid_size)
     ):
         left, top, right, bottom = crop_box
-        crop = image.crop(crop_box)
+        # Resize each independent crop into the common API tile. The crop and
+        # tile have the same aspect ratio, so object geometry is preserved.
+        crop = image.crop(crop_box).resize(tile_size, Image.Resampling.LANCZOS)
         target_crop = target[top:bottom, left:right]
-        alpha = np.where(target_crop, 0, 255).astype(np.uint8)
+        # Nearest-neighbour scaling keeps the uploaded alpha strictly 0/255.
+        scaled_target = np.asarray(
+            Image.fromarray(target_crop.astype(np.uint8) * 255, "L").resize(
+                tile_size, Image.Resampling.NEAREST
+            )
+        ) > 0
+        alpha = np.where(scaled_target, 0, 255).astype(np.uint8)
         rgba_crop = np.dstack((np.asarray(crop), alpha)).astype(np.uint8)
         x0, y0, _, _ = destination_box
         image_grid.paste(crop, (x0, y0))
@@ -386,7 +387,7 @@ def compose_and_measure(
         original = original_source.convert("RGB")
         original_array = np.asarray(original).copy()
         generated_array = np.asarray(generated)
-        tile_size, crop_boxes, targets = _crop_layout(input_root, digest)
+        _, crop_boxes, targets = _crop_layout(input_root, digest)
 
         frames: list[np.ndarray] = []
         metrics: list[dict[str, Any]] = []
@@ -396,12 +397,13 @@ def compose_and_measure(
         ):
             qx0, qy0, qx1, qy1 = quadrant_box
             model_frame = generated_array[qy0:qy1, qx0:qx1]
+            left, top, right, bottom = crop_box
+            crop_size = (right - left, bottom - top)
             model_crop = np.asarray(
                 Image.fromarray(model_frame, "RGB").resize(
-                    tile_size, Image.Resampling.LANCZOS
+                    crop_size, Image.Resampling.LANCZOS
                 )
             )
-            left, top, right, bottom = crop_box
             target_crop = target[top:bottom, left:right]
             original_crop = original_array[top:bottom, left:right]
             pixel_difference = np.abs(
@@ -410,6 +412,13 @@ def compose_and_measure(
             mean_difference = float(pixel_difference[target_crop].mean())
             changed_ratio = float(
                 (pixel_difference[target_crop] >= MIN_MEAN_DIFFERENCE).mean()
+            )
+            outside = np.logical_not(target_crop)
+            outside_mean = float(pixel_difference[outside].mean()) if outside.any() else 0.0
+            outside_changed_ratio = (
+                float((pixel_difference[outside] >= MIN_MEAN_DIFFERENCE).mean())
+                if outside.any()
+                else 0.0
             )
             passed = (
                 mean_difference >= MIN_MEAN_DIFFERENCE
@@ -421,6 +430,8 @@ def compose_and_measure(
                     "target_pixels": int(target_crop.sum()),
                     "mean_difference": round(mean_difference, 3),
                     "changed_ratio": round(changed_ratio, 4),
+                    "outside_mean_difference": round(outside_mean, 3),
+                    "outside_changed_ratio": round(outside_changed_ratio, 4),
                     "passed": passed,
                 }
             )
@@ -428,7 +439,7 @@ def compose_and_measure(
             previous_crop = previous[top:bottom, left:right]
             # Blend only the rectangular crop boundary. The complete crop is
             # still available in the center, so target expansion is not clipped.
-            alpha = _crop_blend_alpha(tile_size, target_crop)[..., None]
+            alpha = _crop_blend_alpha(crop_size, target_crop)[..., None]
             current_crop = np.rint(
                 previous_crop.astype(np.float32) * (1.0 - alpha)
                 + model_crop.astype(np.float32) * alpha
