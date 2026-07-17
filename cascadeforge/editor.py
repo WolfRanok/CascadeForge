@@ -16,13 +16,13 @@ from urllib.parse import quote
 
 import requests
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from .config import AppConfig, load_config
 
 SUCCESS_STATUSES = {"completed", "succeeded", "success"}
 FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
-PIPELINE_VERSION = "four-target-cropped-v2"
+PIPELINE_VERSION = "four-target-cropped-v3-contour"
 SELECTION_MODE = "four-target-independent-v2"
 LEGACY_INDEPENDENT_MODE = "four-target-independent-v1"
 LEGACY_GLOBAL_MODE = "three-target-global-v3-independent"
@@ -30,8 +30,10 @@ MIN_MEAN_DIFFERENCE = 18.0
 MIN_CHANGED_RATIO = 0.25
 CROP_PADDING_RATIO = 0.35
 MIN_CROP_PADDING = 32
-CROP_FEATHER_RATIO = 0.08
-MIN_CROP_FEATHER = 12
+CONTOUR_DILATION_RATIO = 0.12
+MIN_CONTOUR_DILATION = 4
+MAX_CONTOUR_DILATION = 32
+CONTOUR_ALPHA_CUTOFF = 1 / 255
 SUPPORTED_RATIOS = {
     "16:9": 16 / 9,
     "9:16": 9 / 16,
@@ -302,16 +304,41 @@ def materialize_upload_mask(input_root: Path, digest: str) -> Path:
     return mask_path
 
 
-def _crop_blend_alpha(tile_size: tuple[int, int], target: np.ndarray) -> np.ndarray:
-    """Create a soft crop-edge transition while keeping the target fully opaque."""
-    width, height = tile_size
-    feather = max(MIN_CROP_FEATHER, int(round(min(width, height) * CROP_FEATHER_RATIO)))
-    feather = max(1, min(feather, max(1, min(width, height) // 4)))
-    yy, xx = np.mgrid[0:height, 0:width]
-    distance = np.minimum.reduce((xx, yy, width - 1 - xx, height - 1 - yy)).astype(float)
-    alpha = np.clip(distance / feather, 0.0, 1.0)
-    # The complete crop remains available; only its boundary is blended.
+def _contour_blend_alpha(target: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+    """Build a target-shaped alpha from dilation followed by Gaussian feathering.
+
+    The rectangular crop is intentionally absent from this calculation: only the
+    object mask and its finite contour halo can receive generated pixels.
+    """
+    if target.ndim != 2 or not target.any():
+        raise ValueError("目标 Mask 必须是非空二维布尔数组")
+    area = int(target.sum())
+    equivalent_radius = np.sqrt(area / np.pi)
+    radius = int(
+        np.clip(
+            round(equivalent_radius * CONTOUR_DILATION_RATIO),
+            MIN_CONTOUR_DILATION,
+            MAX_CONTOUR_DILATION,
+        )
+    )
+    # MaxFilter performs binary morphological dilation without extra packages.
+    mask_image = Image.fromarray((target.astype(np.uint8) * 255), "L")
+    dilated_image = mask_image.filter(ImageFilter.MaxFilter(radius * 2 + 1))
+    dilated = np.asarray(dilated_image) > 0
+    # Gaussian blur softens the irregular object contour rather than a rectangle.
+    blurred = np.asarray(
+        dilated_image.filter(ImageFilter.GaussianBlur(max(1.0, radius / 2.0))),
+        dtype=np.float32,
+    ) / 255.0
+    alpha = np.where(blurred >= CONTOUR_ALPHA_CUTOFF, blurred, 0.0)
     alpha[target] = 1.0
+    return alpha.astype(np.float32), dilated, radius
+
+
+def _crop_blend_alpha(tile_size: tuple[int, int], target: np.ndarray) -> np.ndarray:
+    """Compatibility wrapper for callers that only need contour alpha."""
+    del tile_size  # The contour is independent of the surrounding crop rectangle.
+    alpha, _, _ = _contour_blend_alpha(target)
     return alpha
 
 
@@ -392,6 +419,9 @@ def compose_and_measure(
         frames: list[np.ndarray] = []
         metrics: list[dict[str, Any]] = []
         previous = original_array.copy()
+        # Keep a global support map so later targets cannot overwrite earlier
+        # object cores or their contour transition bands.
+        protected_support = np.zeros((original.height, original.width), dtype=bool)
         for index, (target, crop_box, quadrant_box) in enumerate(
             zip(targets, crop_boxes, _quadrant_boxes(width, height)), 1
         ):
@@ -406,6 +436,11 @@ def compose_and_measure(
             )
             target_crop = target[top:bottom, left:right]
             original_crop = original_array[top:bottom, left:right]
+            alpha, dilated, dilation_radius = _contour_blend_alpha(target_crop)
+            support = alpha > 0.0
+            effective_alpha = alpha.copy()
+            prior_support = protected_support[top:bottom, left:right]
+            effective_alpha[prior_support] = 0.0
             pixel_difference = np.abs(
                 model_crop.astype(np.int16) - original_crop.astype(np.int16)
             ).mean(axis=2)
@@ -420,6 +455,14 @@ def compose_and_measure(
                 if outside.any()
                 else 0.0
             )
+            blend_zone = np.logical_and(support, np.logical_not(target_crop))
+            blend_mean = float(pixel_difference[blend_zone].mean()) if blend_zone.any() else 0.0
+            rectangle_outside = np.logical_not(support)
+            rectangle_outside_mean = (
+                float(pixel_difference[rectangle_outside].mean())
+                if rectangle_outside.any()
+                else 0.0
+            )
             passed = (
                 mean_difference >= MIN_MEAN_DIFFERENCE
                 and changed_ratio >= MIN_CHANGED_RATIO
@@ -428,8 +471,13 @@ def compose_and_measure(
                 {
                     "round": index,
                     "target_pixels": int(target_crop.sum()),
+                    "dilated_pixels": int(dilated.sum()),
+                    "alpha_nonzero_pixels": int(support.sum()),
+                    "dilation_radius": dilation_radius,
                     "mean_difference": round(mean_difference, 3),
                     "changed_ratio": round(changed_ratio, 4),
+                    "blend_band_mean_difference": round(blend_mean, 3),
+                    "rectangle_outside_mean_difference": round(rectangle_outside_mean, 3),
                     "outside_mean_difference": round(outside_mean, 3),
                     "outside_changed_ratio": round(outside_changed_ratio, 4),
                     "passed": passed,
@@ -437,18 +485,15 @@ def compose_and_measure(
             )
             current = previous.copy()
             previous_crop = previous[top:bottom, left:right]
-            # Blend only the rectangular crop boundary. The complete crop is
-            # still available in the center, so target expansion is not clipped.
-            alpha = _crop_blend_alpha(crop_size, target_crop)[..., None]
+            # Blend only the object-shaped support; the rectangular crop is
+            # otherwise inherited from the previous complete frame.
+            alpha_3d = effective_alpha[..., None]
             current_crop = np.rint(
-                previous_crop.astype(np.float32) * (1.0 - alpha)
-                + model_crop.astype(np.float32) * alpha
+                previous_crop.astype(np.float32) * (1.0 - alpha_3d)
+                + model_crop.astype(np.float32) * alpha_3d
             ).astype(np.uint8)
-            # If crop boxes overlap, earlier edited targets still remain cumulative.
-            for previous_target in targets[: index - 1]:
-                protected = previous_target[top:bottom, left:right]
-                current_crop[protected] = previous_crop[protected]
             current[top:bottom, left:right] = current_crop
+            protected_support[top:bottom, left:right] |= effective_alpha > 0.0
             frames.append(current)
             previous = current
 

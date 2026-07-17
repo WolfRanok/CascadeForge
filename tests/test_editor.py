@@ -204,14 +204,39 @@ def test_large_target_does_not_force_small_targets_to_full_image(tmp_path, monke
     assert len({(right - left, bottom - top) for left, top, right, bottom in boxes}) > 1
 
 
-def test_crop_paste_uses_soft_boundary_and_full_target(tmp_path):
-    target = np.zeros((20, 30), dtype=bool)
-    target[0, 0] = True
-    alpha = editor._crop_blend_alpha((30, 20), target)
-    assert alpha[0, 0] == 1.0
-    assert alpha[0, 10] == 0.0
-    assert alpha[10, 15] == 1.0
-    assert 0.0 < alpha[1, 15] < 1.0
+@pytest.mark.parametrize("shape", ["circle", "triangle", "irregular"])
+def test_contour_alpha_follows_object_shape(shape):
+    target = np.zeros((96, 96), dtype=bool)
+    yy, xx = np.mgrid[0:96, 0:96]
+    if shape == "circle":
+        target = (xx - 48) ** 2 + (yy - 48) ** 2 <= 12**2
+    elif shape == "triangle":
+        target = (yy >= 35) & (yy <= 65) & (np.abs(xx - 48) <= (yy - 35) / 2)
+    else:
+        target[35:60, 38:46] = True
+        target[52:68, 38:66] = True
+
+    alpha, dilated, radius = editor._contour_blend_alpha(target)
+
+    assert radius >= editor.MIN_CONTOUR_DILATION
+    assert np.all(alpha[target] == 1.0)
+    assert np.all(dilated[target])
+    assert alpha[0, 0] == 0.0 and alpha[-1, -1] == 0.0
+    assert 0 < np.count_nonzero(alpha) < target.size // 2
+    assert np.any((alpha > 0.0) & (alpha < 1.0) & ~target)
+
+
+def test_contour_dilation_radius_adapts_to_target_area():
+    small = np.zeros((512, 512), dtype=bool)
+    small[250:253, 250:253] = True
+    large = np.zeros_like(small)
+    large[100:400, 100:400] = True
+
+    _, _, small_radius = editor._contour_blend_alpha(small)
+    _, _, large_radius = editor._contour_blend_alpha(large)
+
+    assert small_radius == editor.MIN_CONTOUR_DILATION
+    assert small_radius < large_radius <= editor.MAX_CONTOUR_DILATION
 
 
 def test_materialize_upload_mask_converts_legacy_cumulative_masks(tmp_path):
@@ -254,6 +279,8 @@ def test_remote_mask_verification_checks_uploaded_alpha(tmp_path, monkeypatch):
 def test_compose_accumulates_four_target_edits_from_previous_frame(tmp_path, monkeypatch):
     monkeypatch.setattr(editor, "MIN_CROP_PADDING", 2)
     monkeypatch.setattr(editor, "CROP_PADDING_RATIO", 0.2)
+    monkeypatch.setattr(editor, "MIN_CONTOUR_DILATION", 1)
+    monkeypatch.setattr(editor, "MAX_CONTOUR_DILATION", 1)
     root, digest, targets = _make_independent_crop_root(tmp_path)
     generated = Image.new("RGB", (200, 200), (200, 0, 0))
     colors = [(240, 0, 0), (0, 240, 0), (0, 0, 240), (240, 240, 0)]
@@ -271,25 +298,48 @@ def test_compose_accumulates_four_target_edits_from_previous_frame(tmp_path, mon
     result = np.asarray(Image.open(output_path).convert("RGB"))
     frames = [result[0:100, 0:100], result[0:100, 100:200],
               result[100:200, 0:100], result[100:200, 100:200]]
-    _, crop_boxes, _ = editor._crop_layout(root, digest)
     for round_index, frame in enumerate(frames):
         for target_index, (x, y) in enumerate(targets):
             expected = colors[target_index] if target_index <= round_index else (20, 20, 20)
-            assert np.allclose(frame[y * 5, x * 5], expected, atol=25)
-        # The full current patch is pasted, including its surrounding context.
-        left, top, _, _ = crop_boxes[round_index]
-        assert np.allclose(
-            frame[int((top + 1.5) * 5), int((left + 1.5) * 5)],
-            colors[round_index],
-            atol=25,
-        )
-        # The outer crop edge remains the previous frame, preventing a hard seam.
-        assert np.allclose(
-            frame[int((top + 0.5) * 5), int((left + 1.5) * 5)],
-            (20, 20, 20),
-            atol=25,
-        )
+            assert np.allclose(frame[y * 5, x * 5], expected, atol=45)
+        # A location far from all object contours stays on the previous frame
+        # even though every provider quadrant is filled with a solid color.
         assert np.allclose(frame[50, 50], (20, 20, 20), atol=25)
+        assert metrics[round_index]["alpha_nonzero_pixels"] <= 25
+        assert "rectangle_outside_mean_difference" in metrics[round_index]
+
+
+def test_later_round_protects_previous_contour_support(tmp_path, monkeypatch):
+    monkeypatch.setattr(editor, "MIN_CROP_PADDING", 8)
+    monkeypatch.setattr(editor, "MIN_CONTOUR_DILATION", 3)
+    monkeypatch.setattr(editor, "MAX_CONTOUR_DILATION", 3)
+    root, digest, _ = _make_independent_crop_root(tmp_path)
+    positions = [(7, 10), (10, 10), (2, 2), (17, 17)]
+    mask_grid = Image.new("RGBA", (40, 40), (20, 20, 20, 255))
+    for index, (x, y) in enumerate(positions):
+        tile = Image.new("RGBA", (20, 20), (20, 20, 20, 255))
+        tile.putpixel((x, y), (20, 20, 20, 0))
+        mask_grid.paste(tile, ((index % 2) * 20, (index // 2) * 20))
+    mask_grid.save(root / "MASK" / f"{digest}_MASK.png")
+    generated = Image.new("RGB", (200, 200), (20, 20, 20))
+    colors = [(240, 0, 0), (0, 240, 0), (0, 0, 240), (240, 240, 0)]
+    for index, color in enumerate(colors):
+        generated.paste(
+            Image.new("RGB", (100, 100), color), ((index % 2) * 100, (index // 2) * 100)
+        )
+    raw_path = tmp_path / "overlap-raw.png"
+    output_path = tmp_path / "overlap-output.png"
+    generated.save(raw_path)
+
+    passed, _ = editor.compose_and_measure(root, digest, raw_path, output_path)
+
+    assert passed
+    result = np.asarray(Image.open(output_path).convert("RGB"))
+    round_2 = result[0:100, 100:200]
+    # When targets are artificially closer than selection allows, historical
+    # support wins even at an overlapping later core.
+    assert round_2[50, 40, 0] > round_2[50, 40, 1]
+    assert round_2[50, 50, 0] > round_2[50, 50, 1]
 
 
 def test_quality_gate_rejects_invisible_target_edits(tmp_path):
@@ -323,7 +373,7 @@ def test_old_quality_sidecar_does_not_block_cropped_pipeline(tmp_path):
     quality = root / ".cascadeforge" / "quality" / "sample.json"
     quality.parent.mkdir(parents=True)
     quality.write_text(
-        '{"version":"four-target-independent-v1","passed":false}', encoding="utf-8"
+        '{"version":"four-target-cropped-v2","passed":false}', encoding="utf-8"
     )
     assert not editor._is_rejected(root, "sample")
 
@@ -336,7 +386,7 @@ def test_old_download_cache_cannot_reuse_raw_full_image_result(tmp_path):
         json.dumps(
             {
                 "url": "https://example.invalid/old.jpg",
-                "pipeline_version": "four-target-independent-v1",
+                "pipeline_version": "four-target-cropped-v2",
             }
         ),
         encoding="utf-8",
