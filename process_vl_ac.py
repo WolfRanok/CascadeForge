@@ -6,4 +6,4 @@ from cascadeforge.select import run_selection
 
 
 if __name__ == "__main__":
-    raise SystemExit(run_selection(Path("IMAGE_MASK"), None))
+    raise SystemExit(run_selection(Path("IMAGE_MASK"), None, concurrency=200))
