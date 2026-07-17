@@ -163,6 +163,16 @@ def test_materialize_edit_inputs_creates_cropped_image_and_mask(tmp_path, monkey
         assert [int(item.sum()) for item in quadrants] == [1, 1, 1, 1]
 
 
+def test_crop_paste_uses_soft_boundary_and_full_target(tmp_path):
+    target = np.zeros((20, 30), dtype=bool)
+    target[0, 0] = True
+    alpha = editor._crop_blend_alpha((30, 20), target)
+    assert alpha[0, 0] == 1.0
+    assert alpha[0, 10] == 0.0
+    assert alpha[10, 15] == 1.0
+    assert 0.0 < alpha[1, 15] < 1.0
+
+
 def test_materialize_upload_mask_converts_legacy_cumulative_masks(tmp_path):
     root, digest, _ = _make_legacy_mask_root(tmp_path)
     upload_mask = editor.materialize_upload_mask(root, digest)
@@ -227,7 +237,17 @@ def test_compose_accumulates_four_target_edits_from_previous_frame(tmp_path, mon
             assert np.allclose(frame[y * 5, x * 5], expected, atol=25)
         # The full current patch is pasted, including its surrounding context.
         left, top, _, _ = crop_boxes[round_index]
-        assert np.allclose(frame[(top + 1) * 5, (left + 1) * 5], colors[round_index], atol=25)
+        assert np.allclose(
+            frame[int((top + 1.5) * 5), int((left + 1.5) * 5)],
+            colors[round_index],
+            atol=25,
+        )
+        # The outer crop edge remains the previous frame, preventing a hard seam.
+        assert np.allclose(
+            frame[int((top + 0.5) * 5), int((left + 1.5) * 5)],
+            (20, 20, 20),
+            atol=25,
+        )
         assert np.allclose(frame[50, 50], (20, 20, 20), atol=25)
 
 

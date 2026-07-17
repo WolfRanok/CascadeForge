@@ -29,6 +29,8 @@ MIN_MEAN_DIFFERENCE = 18.0
 MIN_CHANGED_RATIO = 0.25
 CROP_PADDING_RATIO = 0.35
 MIN_CROP_PADDING = 32
+CROP_FEATHER_RATIO = 0.08
+MIN_CROP_FEATHER = 12
 SUPPORTED_RATIOS = {
     "16:9": 16 / 9,
     "9:16": 9 / 16,
@@ -299,6 +301,19 @@ def materialize_upload_mask(input_root: Path, digest: str) -> Path:
     return mask_path
 
 
+def _crop_blend_alpha(tile_size: tuple[int, int], target: np.ndarray) -> np.ndarray:
+    """Create a soft crop-edge transition while keeping the target fully opaque."""
+    width, height = tile_size
+    feather = max(MIN_CROP_FEATHER, int(round(min(width, height) * CROP_FEATHER_RATIO)))
+    feather = max(1, min(feather, max(1, min(width, height) // 4)))
+    yy, xx = np.mgrid[0:height, 0:width]
+    distance = np.minimum.reduce((xx, yy, width - 1 - xx, height - 1 - yy)).astype(float)
+    alpha = np.clip(distance / feather, 0.0, 1.0)
+    # The complete crop remains available; only its boundary is blended.
+    alpha[target] = 1.0
+    return alpha
+
+
 def verify_remote_mask(url: str, local_path: Path) -> dict[str, Any]:
     """Confirm that the exact public URL exposes an equivalent RGBA mask."""
     response = requests.get(url, timeout=120)
@@ -410,11 +425,15 @@ def compose_and_measure(
                 }
             )
             current = previous.copy()
-            current_crop = model_crop.copy()
             previous_crop = previous[top:bottom, left:right]
-            # A complete crop is pasted so target motion or outline expansion
-            # is not clipped by the original segmentation boundary. If crop
-            # boxes overlap, earlier edited targets still remain cumulative.
+            # Blend only the rectangular crop boundary. The complete crop is
+            # still available in the center, so target expansion is not clipped.
+            alpha = _crop_blend_alpha(tile_size, target_crop)[..., None]
+            current_crop = np.rint(
+                previous_crop.astype(np.float32) * (1.0 - alpha)
+                + model_crop.astype(np.float32) * alpha
+            ).astype(np.uint8)
+            # If crop boxes overlap, earlier edited targets still remain cumulative.
             for previous_target in targets[: index - 1]:
                 protected = previous_target[top:bottom, left:right]
                 current_crop[protected] = previous_crop[protected]
